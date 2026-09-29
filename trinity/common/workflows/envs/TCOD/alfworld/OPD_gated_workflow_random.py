@@ -1,41 +1,48 @@
 # -*- coding: utf-8 -*-
-"""On-Policy Distillation (OPD) workflow for AlfWorld.
+"""Gated OPD workflow for AlfWorld -- RANDOM-GATING control, full-memory.
 
-Reference: OnPolicyDistillWorkflow logic; adapted for multi-turn AlfWorld.
+Control condition for OPD_gated_workflow_fullmemory.py (the reasoning-prompt
+teacher-yes/no gated variant that reached avg@4 pooled 43.8% at 250 steps /
+16.33h -- see that file's and opd_gated_fullmemory.yaml's docstrings). That
+run's measured overall teacher apply-rate (teacher says "No" -> OPD
+correction applied) was 32.7% across its full 250-step run (n=175 logged
+points, std 5.4pp) -- see RANDOM_APPLY_RATE below.
 
-Algorithm:
-1. Student pre-samples trajectory (runs episode turn-by-turn with logprobs)
-2. Split by turns: each turn has a fixed, self-contained single-turn prompt
-   (see below -- NOT the whole prior conversation)
-3. Teacher computes logprobs on same (prefix + response) per turn
-4. Store teacher_logprobs in experience; advantage_fn uses teacher_logprobs - student_logprobs
-5. Return one Experience per turn (like OPD returning one per sample)
+This file answers: does the teacher's actual judgment about WHICH turns to
+apply OPD to matter, or does training with OPD applied to roughly the same
+FRACTION of turns -- chosen uniformly at random, with no teacher involvement
+in the gating decision at all -- produce a similar result? If random gating
+at the same rate matches the teacher-gated run's performance, that would
+suggest the earlier result is explained by turn-fraction / effective
+learning-rate-like dynamics (fewer turns getting a nonzero OPD advantage
+each step), not by the teacher correctly identifying which turns most need
+correction. If random gating clearly underperforms, that's evidence the
+teacher's per-turn judgment carries real signal.
 
-Fix history: this file originally accumulated a growing `memory` list across
-turns (every past (user, assistant) pair for the whole episode, up to
-max_env_steps=30), IN ADDITION to the already-capped 2-step textual summary
-embedded in each turn's own `user_content` (via ALFWORLD_TEMPLATE,
-HISTORY_LENGTH=2). A real vanilla-OPD training run using that design showed
-`prompt_length/clip_ratio` of 0.52-0.67 by mid-training (55-67% of ALL
-training prompts silently truncated at model.max_prompt_tokens=10240,
-cutting off the END of the conversation -- i.e. each turn's own
-"<action></action>" formatting instruction). The resulting checkpoint failed
-100% at eval: across 24 evaluated episodes / 720 turns, 0/720 ever even
-opened an `<action>` tag -- the model spent its entire generation budget
-rambling and never learned to close a response, having been trained on a
-majority of prompts with its own formatting instructions deleted. Fixed here
-(mirroring the identical fix applied earlier to OPD_gated_workflow.py) by
-rebuilding `messages` fresh each turn instead of accumulating it, so the
-capped 2-step summary is the ONLY history reaching the model. See
-OPD_gated_workflow.py's module docstring for the fuller writeup (TCOD paper
-Eq. 1 vs. Table 5; DASH-OPD paper Appendix Table 5's "Interaction context"
-row, which documents full-history retention as the papers' literal intended
-design -- this fix is a deliberate, evidence-based departure from that
-design for this teacher/student pairing, not a misunderstanding of it).
+Only real changes from OPD_gated_workflow_fullmemory.py:
+  1. No teacher yes/no call at all -- _ask_teacher_yes_no and the
+     consistency-prompt machinery (YES_NO_ADDENDUM, parse_yes_no,
+     consistency_temperature/consistency_max_tokens config, and the
+     consistency_parse_success_rate / consistency_response_length_*
+     trajectory metrics, none of which apply here) are all removed.
+  2. `apply_opd` is drawn from `random.random() < RANDOM_APPLY_RATE` instead
+     of the teacher's verdict. Everything else (growing full-memory
+     `messages`, teacher_logprobs computation on every turn regardless of
+     the gate decision, teacher_logprobs_valid_mask masking mechanism,
+     reward/metrics bookkeeping) is identical.
+  3. As a side effect, removing the teacher yes/no call also removes its
+     latency cost entirely -- this variant should run close to (or faster
+     than) vanilla OPD's per-step time, not the ~80% slower reasoning-prompt
+     gated run's, since there is no extra per-turn teacher generation call
+     of any kind for gating (the teacher is still called once per turn for
+     logprobs scoring, exactly as in ungated vanilla OPD).
 """
 
+import random
 from dataclasses import asdict
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import torch
 
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
@@ -52,21 +59,23 @@ from trinity.common.workflows.envs.TCOD.alfworld.utils import (
     _create_alfworld_env,
 )
 
-@WORKFLOWS.register_module("OPD_alfworld_workflow")
-class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
-    """On-policy distillation workflow for AlfWorld.
+# Measured overall opd_gate_apply_rate from the teacher-gated reasoning-
+# prompt full-memory run (alfworld_opd_gated_fullmemory_20260924145239):
+# mean 0.3266 (32.7%) across n=175 logged trajectory-level data points
+# spanning its complete 250-step run, std 0.0538. Fixed here (not
+# recomputed dynamically) so this run's gate-apply rate is a controlled,
+# known constant to compare against, rather than something that could drift.
+RANDOM_APPLY_RATE = 0.327
 
-    Computes and stores teacher_logprobs in each turn's experience.
-    The advantage_fn in trainer will compute:
-        advantages = teacher_logprobs - student_logprobs
 
-    Use advantage_fn: multi_turn_opd (MultiTurnOpdAdvantage) for this workflow,
-    since it returns List[Experience] (one per turn), not a single response.
+@WORKFLOWS.register_module("OPD_gated_alfworld_workflow_random")
+class OPDGatedAlfworldWorkflowRandom(Workflow):
+    """On-policy distillation workflow for AlfWorld, RANDOM-gating control.
 
-    Logic aligned with OnPolicyDistillWorkflow:
-    - Student samples (with logprobs); teacher computes logprobs on same sequences.
-    - Per-turn split: prefix fixed per turn, one Experience per turn.
-    - compute_reward() can be overridden by subclasses (default: episode final reward).
+    Identical to OPDGatedAlfworldWorkflowFullMemory (OPD_gated_workflow_
+    fullmemory.py) except which turns get the OPD correction is decided by
+    an independent random draw at a fixed rate (RANDOM_APPLY_RATE) instead
+    of a teacher yes/no consistency judgment. See module docstring.
     """
 
     is_async: bool = True
@@ -124,14 +133,6 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
     def rollout_args(self):
         return asdict(self.task.rollout_args)
 
-    def format_messages(self):
-        """Format initial messages for the episode.
-
-        Uses ALFWORLD_TEMPLATE_NO_HIS / ALFWORLD_TEMPLATE from utils.py.
-        No system prompt; each user message is self-contained.
-        """
-        return []
-
     async def run_async(self) -> List[Experience]:
         game_file_path = self.task_desc
         env = _create_alfworld_env(game_file_path)
@@ -149,9 +150,16 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
         history: List[str] = []
         turn_responses: List[Experience] = []
 
+        # Growing conversation across turns -- same full-memory mechanism as
+        # OPD_gated_workflow_fullmemory.py / OPD_workflow_fullmemory.py.
+        memory: List[Dict[str, str]] = []
+
         kwargs = {**self.rollout_args, "n": 1}
         if kwargs.get("logprobs") is None:
             kwargs["logprobs"] = 0
+
+        n_gated_apply = 0  # turns where the random draw applied OPD
+        n_gated_skip = 0  # turns where the random draw skipped OPD
 
         for r in range(self.max_env_steps):
             format_obs = format_observation(observation)
@@ -183,25 +191,32 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
                     admissible_actions=reformatted_admissible,
                 )
 
-            # Single self-contained turn: no growing raw conversation. The
-            # capped 2-step summary already embedded in `user_content` (via
-            # ALFWORLD_TEMPLATE, HISTORY_LENGTH) is the only history sent to
-            # the model. See this file's module docstring for why.
-            messages = self.format_messages() + [{"role": "user", "content": user_content}]
+            memory = memory + [{"role": "user", "content": user_content}]
 
             # Step 1: Student samples this turn (same pattern as OnPolicyDistillWorkflow)
-            responses = await self.model.chat_async(messages, **kwargs)
+            responses = await self.model.chat_async(memory, **kwargs)
             response = responses[0]
             response_text = response.response_text or ""
+            memory = memory + [{"role": "assistant", "content": response_text}]
 
             if response.logprobs is None:
                 raise RuntimeError(
-                    "OnPolicyDistillAlfworldWorkflow requires student model to return logprobs. "
-                    "Set rollout_args.logprobs (e.g. 0) in task config."
+                    "OPDGatedAlfworldWorkflowRandom requires student model to return "
+                    "logprobs. Set rollout_args.logprobs (e.g. 0) in task config."
                 )
-            turn_responses.append(response)
 
             action = parse_action(response_text)
+
+            # RANDOM gating: no teacher call at all -- see module docstring.
+            apply_opd = random.random() < RANDOM_APPLY_RATE
+            response.opd_gate_apply = apply_opd  # consumed in the logprobs loop below
+            if apply_opd:
+                n_gated_apply += 1
+            else:
+                n_gated_skip += 1
+
+            turn_responses.append(response)
+
             history.append(_format_history(format_obs, r + 1, action))
             observation, reward, done, info = env.step(action)
             if done:
@@ -213,12 +228,11 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
             self._env_rounds = self.max_env_steps
             self._final_reward = 0.0  # failure: exhausted max steps
 
-        # Step 2 & 3: Teacher logprobs and fill experience (mirror OnPolicyDistillWorkflow.run_async)
-        # response.tokens is the full sequence for this turn: [prefix | response], where
-        # prefix = this turn's single self-contained user message (task
-        # description + capped 2-step action_history + current observation +
-        # admissible actions -- see `messages` construction above), NOT the
-        # whole episode's conversation. Same input the student had.
+        # Step 2 & 3: Teacher logprobs and fill experience -- IDENTICAL to
+        # OPD_gated_workflow_fullmemory.py: every turn still gets scored by
+        # the teacher regardless of the gate decision (the gate only decides
+        # whether that score contributes to the training advantage via
+        # teacher_logprobs_valid_mask below).
         per_turn_kl_sums: List[float] = []
         for i, response in enumerate(turn_responses):
             teacher_logprobs = await self.teacher_model.logprobs_async(
@@ -238,17 +252,24 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
 
             response.teacher_logprobs = teacher_resp_logprobs
 
+            apply_opd = getattr(response, "opd_gate_apply", True)
+            response.teacher_logprobs_valid_mask = torch.full(
+                (len(teacher_resp_logprobs),), apply_opd, dtype=torch.bool
+            )
+
             if response.metrics is None:
                 response.metrics = {}
             response.reward = self.compute_reward(response)
             response.eid.run = getattr(self, "run_id_base", 0)
             response.eid.step = i
+            response.metrics["opd_gate_applied"] = 1.0 if apply_opd else 0.0
 
             kl_sum = (student_resp_logprobs - teacher_resp_logprobs).sum().item()
             per_turn_kl_sums.append(kl_sum)
 
         # Trajectory-level metrics (computed once for the whole trajectory)
         trajectory_kl_divergence = sum(per_turn_kl_sums)
+        n_gated_total = n_gated_apply + n_gated_skip
         if turn_responses:
             last_response = turn_responses[-1]
             if last_response.metrics is None:
@@ -256,5 +277,8 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
             last_response.metrics["env_rounds"] = self._env_rounds
             last_response.metrics["env_done"] = 1.0 if self._env_done else 0.0
             last_response.metrics["kl_divergence"] = trajectory_kl_divergence
+            last_response.metrics["opd_gate_apply_rate"] = (
+                n_gated_apply / n_gated_total if n_gated_total else 0.0
+            )
 
         return turn_responses

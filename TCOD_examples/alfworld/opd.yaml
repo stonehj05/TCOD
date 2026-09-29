@@ -3,6 +3,17 @@ name: "alfworld_opd"
 checkpoint_root_dir: ./checkpoints
 continue_from_checkpoint: false
 
+# Vanilla OPD: identical to opd_gated.yaml except default_workflow_type
+# below (plain OPD_alfworld_workflow, no yes/no consistency gating), the
+# buffer/experience-buffer names, AND (as of this revision) the model
+# pairing -- this file now uses the paper-confirmed plain Qwen3-4B student /
+# plain Qwen3-30B-A3B teacher (see model/auxiliary_models comments below),
+# while opd_gated.yaml as of this revision still uses the -Instruct-2507
+# teacher. Revert opd_gated.yaml's teacher too if an apples-to-apples
+# gated-vs-vanilla comparison is needed again. See
+# trinity/common/workflows/envs/TCOD/alfworld/OPD_workflow.py for the
+# (ungated) mechanism this runs.
+
 algorithm:
   sample_strategy: staleness_control
   sample_strategy_args:
@@ -16,8 +27,16 @@ algorithm:
     lr: 1e-6
 
 model:
-  # Student model
-  model_path: Qwen/Qwen2.5-3B-Instruct
+  # Student model: reverted back to the bare Qwen/Qwen3-4B (a hybrid think/
+  # non-think model, enable_thinking=False). The earlier -Instruct-2507 swap
+  # was based on a third-party GitHub comment's workaround for a rambling
+  # failure mode; GitHub issue kokolerk/TCOD#4 comment 3 (the paper's own
+  # author) directly confirms the paper's actual student is the plain,
+  # no-suffix https://huggingface.co/Qwen/Qwen3-4B -- reverting to match
+  # that confirmed setup, now that the memory-list fix + DASH-OPD prompt
+  # template fix (this session's other changes) independently addressed
+  # the original rambling issue without needing the -Instruct-2507 student.
+  model_path: Qwen/Qwen3-4B
   max_prompt_tokens: 10240
   max_response_tokens: 512
 
@@ -29,12 +48,11 @@ buffer:
   total_steps: 250
   batch_size: 16
   train_batch_size: 64
-  # train_batch_size: 16 x
   explorer_input:
     taskset:
       name: alfworld
       storage_type: file
-      path: /path/to/alfworld_data/train_expert.jsonl
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
       split: train
       format:
         prompt_key: 'game_file'
@@ -44,68 +62,6 @@ buffer:
         logprobs: 0
       workflow_args:
         max_env_steps: 30
-        # naive: true
-        # total_steps: 250
-        # checkpoint_strategy: linear_decay
-        # checkpoint_decay_steps: 5  # Complete decay in first 70% of training steps
-    # eval_tasksets:
-      # - name: alfworld_eval_seen
-      #   storage_type: file
-      #   path: /path/to/alfworld_data/test.jsonl
-      #   split: test
-      #   total_steps: 10
-      #   task_selector:
-      #     selector_type: random
-      #     seed: 42
-      #   format:
-      #     prompt_key: 'game_file'
-      #   rollout_args:
-      #     temperature: 0.4
-      #     logprobs: 0
-      #   # workflow_args:
-      #   #   max_env_steps: 30
-      #   #   naive: true
-      #   #   total_steps: 250
-      #   #   checkpoint_strategy: linear_decay
-      #   #   checkpoint_decay_steps: 5
-      # - name: alfworld_eval_unseen
-      #   storage_type: file
-      #   path: /path/to/alfworld_data/test_unseen.jsonl
-      #   split: test
-      #   total_steps: 10
-      #   task_selector:
-      #     selector_type: random
-      #     seed: 42
-      #   format:
-      #     prompt_key: 'game_file'
-      #   rollout_args:
-      #     temperature: 0.4
-      #     logprobs: 0
-      #   # workflow_args:
-      #   #   max_env_steps: 30
-      #   #   naive: true
-      #   #   total_steps: 250
-      #   #   checkpoint_strategy: linear_decay
-      #   #   checkpoint_decay_steps: 5
-    #   - name: alfworld_eval_hard
-    #     storage_type: file
-    #     path: /path/to/alfworld_data/train_hard.jsonl
-    #     split: test
-    #     total_steps: 10
-    #     task_selector:
-    #       selector_type: random
-    #       seed: 42
-    #     format:
-    #       prompt_key: 'game_file'
-    #     rollout_args:
-    #       temperature: 0.4
-    #       logprobs: 0
-    #     # workflow_args:
-    #     #   max_env_steps: 30
-    #     #   # naive: true
-    #     #   # total_steps: 250
-    #     #   # checkpoint_strategy: linear_decay
-    #     #   # checkpoint_decay_steps: 5
     default_workflow_type: 'OPD_alfworld_workflow'
   trainer_input:
     experience_buffer:
@@ -118,9 +74,17 @@ explorer:
   runner_per_model: 8
   max_timeout: 3600
   rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated.yaml. The 4B
+    # student comfortably fits on a single GPU each, so 2 replicas (2
+    # concurrent generation streams) cost only 2 GPUs, not 4. The 30B-A3B
+    # teacher's fixed 4-GPU requirement (below) leaves limited room for
+    # rollout once the Trainer's own GPU share is accounted for (see
+    # config_validator.py's _set_gpu_allocation_info: Explorer
+    # (rollout + teacher) and Trainer use DISJOINT GPUs, and Explorer must
+    # be strictly less than the total: 2+4=6 < 8, leaving trainer_gpu_num=2,
+    # which evenly divides buffer.train_batch_size=64).
     engine_num: 2
-    tensor_parallel_size: 2
-    # enable_thinking: false
+    tensor_parallel_size: 1
     enable_prefix_caching: false
     enforce_eager: true
     dtype: bfloat16
@@ -128,11 +92,19 @@ explorer:
     gpu_memory_utilization: 0.7
     enable_chunked_prefill: true
   auxiliary_models:
-    # Teacher model
-    - model_path: /path/to/teacher
+    # Teacher model: reverted back to the bare Qwen/Qwen3-30B-A3B (no
+    # -Instruct-2507 suffix) -- GitHub issue kokolerk/TCOD#4 comment 3 (the
+    # paper's own author) directly confirms this plain checkpoint
+    # (https://huggingface.co/Qwen/Qwen3-30B-A3B) is what Table 3 actually
+    # used, not -Instruct-2507. Standalone zero-shot evals this session also
+    # found the plain teacher scores higher under the full-memory eval
+    # protocol (42.7% pooled vs. -Instruct-2507's 36.5%), closer to the
+    # paper's reported 39.57%. tensor_parallel_size=4 -- matches
+    # opd_gated.yaml (this project's own vLLM deployment of this model size
+    # needed 4 GPUs for inference).
+    - model_path: Qwen/Qwen3-30B-A3B
       engine_num: 1
-      # enable_thinking: false
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4
       enable_prefix_caching: false
       enforce_eager: true
       dtype: bfloat16
@@ -151,9 +123,8 @@ synchronizer:
   sync_timeout: 3600
 
 trainer:
-  # train_batch
   total_steps: 250
-  save_interval: 250
+  save_interval: 25
   grad_clip: 1.0
   use_dynamic_bsz: true
   max_token_len_per_gpu: 16384

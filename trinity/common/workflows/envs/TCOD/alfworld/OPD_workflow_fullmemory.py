@@ -1,41 +1,42 @@
 # -*- coding: utf-8 -*-
-"""On-Policy Distillation (OPD) workflow for AlfWorld.
+"""On-Policy Distillation (OPD) workflow for AlfWorld -- FULL-MEMORY variant.
 
-Reference: OnPolicyDistillWorkflow logic; adapted for multi-turn AlfWorld.
+Deliberate sibling of OPD_workflow.py, NOT a replacement for it. That file's
+own docstring documents why it was fixed to rebuild `messages` fresh every
+turn (a single self-contained turn, capped HISTORY_LENGTH=2 textual summary
+only): a prior full-memory training run showed prompt_length/clip_ratio of
+0.52-0.67 at max_prompt_tokens=10240, silently truncating over half of all
+training prompts and producing a checkpoint that never learned to close an
+<action> tag (0/720 turns).
 
-Algorithm:
-1. Student pre-samples trajectory (runs episode turn-by-turn with logprobs)
-2. Split by turns: each turn has a fixed, self-contained single-turn prompt
-   (see below -- NOT the whole prior conversation)
-3. Teacher computes logprobs on same (prefix + response) per turn
-4. Store teacher_logprobs in experience; advantage_fn uses teacher_logprobs - student_logprobs
-5. Return one Experience per turn (like OPD returning one per sample)
+This file exists to re-test full-memory training WITHOUT raising any length
+limits (max_prompt_tokens/max_response_tokens/max_token_len_per_gpu all left
+exactly as opd.yaml already has them), per an explicit request to instead
+test whether the plain (non-Instruct) Qwen3-30B-A3B teacher -- known from
+this session's zero-shot evals to behave very differently from the
+-Instruct-2507 revision (less prone to rambling/verbose responses) -- avoids
+the original failure mode by keeping the student's own turn responses (and
+therefore the growing conversation) naturally shorter, without needing a
+bigger context budget. This is an open empirical question, not a resolved
+one: if prompt truncation reappears at this same rate, that would indicate
+the original failure was intrinsic to full-memory accumulation over long
+episodes regardless of teacher identity, not specific to the -Instruct-2507
+teacher's verbosity. Watch prompt_length/clip_ratio during training to see
+which hypothesis holds.
 
-Fix history: this file originally accumulated a growing `memory` list across
-turns (every past (user, assistant) pair for the whole episode, up to
-max_env_steps=30), IN ADDITION to the already-capped 2-step textual summary
-embedded in each turn's own `user_content` (via ALFWORLD_TEMPLATE,
-HISTORY_LENGTH=2). A real vanilla-OPD training run using that design showed
-`prompt_length/clip_ratio` of 0.52-0.67 by mid-training (55-67% of ALL
-training prompts silently truncated at model.max_prompt_tokens=10240,
-cutting off the END of the conversation -- i.e. each turn's own
-"<action></action>" formatting instruction). The resulting checkpoint failed
-100% at eval: across 24 evaluated episodes / 720 turns, 0/720 ever even
-opened an `<action>` tag -- the model spent its entire generation budget
-rambling and never learned to close a response, having been trained on a
-majority of prompts with its own formatting instructions deleted. Fixed here
-(mirroring the identical fix applied earlier to OPD_gated_workflow.py) by
-rebuilding `messages` fresh each turn instead of accumulating it, so the
-capped 2-step summary is the ONLY history reaching the model. See
-OPD_gated_workflow.py's module docstring for the fuller writeup (TCOD paper
-Eq. 1 vs. Table 5; DASH-OPD paper Appendix Table 5's "Interaction context"
-row, which documents full-history retention as the papers' literal intended
-design -- this fix is a deliberate, evidence-based departure from that
-design for this teacher/student pairing, not a misunderstanding of it).
+Only real change from OPD_workflow.py: `_run_episode` accumulates a growing
+`self._memory` list of every turn's (user, assistant) messages instead of
+rebuilding a fresh single-turn `messages` list each round -- mirrors the
+eval-side split between run_episode_tcod.py (single self-contained turn) and
+run_episode.py (growing memory) in alfworld_ts_probe/. Each turn's
+`user_content` still embeds the same capped HISTORY_LENGTH=2 textual summary
+via ALFWORLD_TEMPLATE -- that part is unchanged; the only difference is
+whether the RAW conversation (not just the textual summary) also
+accumulates across turns.
 """
 
 from dataclasses import asdict
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
@@ -52,21 +53,14 @@ from trinity.common.workflows.envs.TCOD.alfworld.utils import (
     _create_alfworld_env,
 )
 
-@WORKFLOWS.register_module("OPD_alfworld_workflow")
-class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
-    """On-policy distillation workflow for AlfWorld.
 
-    Computes and stores teacher_logprobs in each turn's experience.
-    The advantage_fn in trainer will compute:
-        advantages = teacher_logprobs - student_logprobs
+@WORKFLOWS.register_module("OPD_alfworld_workflow_fullmemory")
+class OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory(Workflow):
+    """On-policy distillation workflow for AlfWorld, full-memory variant.
 
-    Use advantage_fn: multi_turn_opd (MultiTurnOpdAdvantage) for this workflow,
-    since it returns List[Experience] (one per turn), not a single response.
-
-    Logic aligned with OnPolicyDistillWorkflow:
-    - Student samples (with logprobs); teacher computes logprobs on same sequences.
-    - Per-turn split: prefix fixed per turn, one Experience per turn.
-    - compute_reward() can be overridden by subclasses (default: episode final reward).
+    Identical to OnPolicyDistillVerlAgentAlfworldWorkflow (OPD_workflow.py)
+    except the student sees the whole accumulated conversation each turn,
+    not a single self-contained turn. See module docstring above.
     """
 
     is_async: bool = True
@@ -124,14 +118,6 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
     def rollout_args(self):
         return asdict(self.task.rollout_args)
 
-    def format_messages(self):
-        """Format initial messages for the episode.
-
-        Uses ALFWORLD_TEMPLATE_NO_HIS / ALFWORLD_TEMPLATE from utils.py.
-        No system prompt; each user message is self-contained.
-        """
-        return []
-
     async def run_async(self) -> List[Experience]:
         game_file_path = self.task_desc
         env = _create_alfworld_env(game_file_path)
@@ -148,6 +134,10 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
         task_description = _extract_task(observation)
         history: List[str] = []
         turn_responses: List[Experience] = []
+
+        # Growing conversation across turns -- the one change from
+        # OPD_workflow.py. See module docstring.
+        memory: List[Dict[str, str]] = []
 
         kwargs = {**self.rollout_args, "n": 1}
         if kwargs.get("logprobs") is None:
@@ -183,21 +173,21 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
                     admissible_actions=reformatted_admissible,
                 )
 
-            # Single self-contained turn: no growing raw conversation. The
-            # capped 2-step summary already embedded in `user_content` (via
-            # ALFWORLD_TEMPLATE, HISTORY_LENGTH) is the only history sent to
-            # the model. See this file's module docstring for why.
-            messages = self.format_messages() + [{"role": "user", "content": user_content}]
+            # Growing conversation: append this turn's user message onto the
+            # full history of every prior turn's (user, assistant) pair,
+            # instead of a fresh single-turn `messages` list.
+            memory = memory + [{"role": "user", "content": user_content}]
 
             # Step 1: Student samples this turn (same pattern as OnPolicyDistillWorkflow)
-            responses = await self.model.chat_async(messages, **kwargs)
+            responses = await self.model.chat_async(memory, **kwargs)
             response = responses[0]
             response_text = response.response_text or ""
+            memory = memory + [{"role": "assistant", "content": response_text}]
 
             if response.logprobs is None:
                 raise RuntimeError(
-                    "OnPolicyDistillAlfworldWorkflow requires student model to return logprobs. "
-                    "Set rollout_args.logprobs (e.g. 0) in task config."
+                    "OnPolicyDistillAlfworldWorkflowFullMemory requires student model to "
+                    "return logprobs. Set rollout_args.logprobs (e.g. 0) in task config."
                 )
             turn_responses.append(response)
 
@@ -215,10 +205,9 @@ class OnPolicyDistillVerlAgentAlfworldWorkflow(Workflow):
 
         # Step 2 & 3: Teacher logprobs and fill experience (mirror OnPolicyDistillWorkflow.run_async)
         # response.tokens is the full sequence for this turn: [prefix | response], where
-        # prefix = this turn's single self-contained user message (task
-        # description + capped 2-step action_history + current observation +
-        # admissible actions -- see `messages` construction above), NOT the
-        # whole episode's conversation. Same input the student had.
+        # prefix is now the FULL accumulated conversation up to and including
+        # this turn's user message (not a single self-contained turn as in
+        # OPD_workflow.py) -- same input the student had.
         per_turn_kl_sums: List[float] = []
         for i, response in enumerate(turn_responses):
             teacher_logprobs = await self.teacher_model.logprobs_async(

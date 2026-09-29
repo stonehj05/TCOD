@@ -1,32 +1,59 @@
 from typing import List
 
 # --------------------- ALFWorld --------------------- #
+# Fixed to match the DASH-OPD paper's (arXiv:2607.29078) Appendix H prompt
+# templates verbatim -- the paper explicitly states "[t]he templates request
+# reasoning before the action but do not require <thought> or <think> tags"
+# and its own template box ends with "Do not output any other text besides
+# your reasoning and the action." TCOD's original shipped template did the
+# opposite on both counts (required a <think></think> block, had no
+# anti-rambling instruction) -- a real, previously-identified discrepancy
+# between the actual training codebase and the paper's documented design,
+# separate from the memory-list fix. Plausibly a contributing cause of the
+# response-length-blowup failure mode: an open-ended "<think>" requirement
+# with no length/stopping constraint is a natural setup for a model to
+# never converge to an action. See alfworld_ts_probe/alfworld_agent_utils.py
+# for the standalone-probe-pipeline copy this was already fixed in (built
+# before this training-code copy was updated to match).
 ALFWORLD_TEMPLATE_NO_HIS = """
 You are an expert agent operating in the ALFRED Embodied Environment.
 Your current observation is: {current_observation}
-Your admissible actions of the current situation are: [{admissible_actions}].
+Your admissible actions of the current situation are:
+[{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
-Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+You should first reason about the current situation.
+Once you've finished your reasoning, you should choose the best admissible action for the current step and present it within <action> </action> tags.
+Do not output any other text besides your reasoning and the action.
 """
 
 ALFWORLD_TEMPLATE = """
-You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
+You are an expert agent operating in the ALFRED Embodied Environment.
+Your task is to: {task_description}
 Prior to this step, you have already taken {step_count} step(s). Below are the most recent {history_length} observations and the corresponding actions you took: {action_history}
 You are now at step {current_step} and your current observation is: {current_observation}
-Your admissible actions of the current situation are: [{admissible_actions}].
+Your admissible actions of the current situation are:
+[{admissible_actions}].
 
 Now it's your turn to take an action.
-You should first reason step-by-step about the current situation. This reasoning process MUST be enclosed within <think> </think> tags. 
-Once you've finished your reasoning, you should choose an admissible action for current step and present it within <action> </action> tags.
+You should first reason about the current situation.
+Once you've finished your reasoning, you should choose the best admissible action for the current step and present it within <action> </action> tags.
+Do not output any other text besides your reasoning and the action.
 """
 
 def parse_action(response):
+    # Guarded against a missing <action> tag (e.g. the model narrates in
+    # plain prose and never emits the tag) -- the previous unconditional
+    # response.split("<action>")[1] raised IndexError in that case, caught
+    # by the broad except below and logged as noise on every occurrence.
+    # rsplit(..., 1) takes the LAST <action> tag if the model's own
+    # reasoning happens to mention the literal string "<action>" earlier
+    # in its response. Matches the equivalent fix already applied in
+    # alfworld_ts_probe/alfworld_agent_utils.py's parse_action.
     try:
-        # parse the action within the <action> </action> tag
-        action = response.split("<action>")[1].split("</action>")[0].strip()
-        return action
+        if "<action>" in response:
+            return response.rsplit("<action>", 1)[-1].split("</action>")[0].strip()
+        return ""
     except Exception as e:
         print(f"Error parsing action: {e}, response = {response}")
         return ""

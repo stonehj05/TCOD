@@ -1,0 +1,156 @@
+project: "ALFWORLD_TCOD"
+# name must stay exactly "alfworld_opd_fullmemory" (not a fresh/timestamped
+# name) so checkpoint_job_dir resolves to the completed 250-step run's own
+# dir and continue_from_checkpoint's resume_mode="auto" finds it -- verified
+# clean (latest_checkpointed_iteration.txt / latest_state_dict_iteration.txt
+# both say 250, all step-250 .pt shards pass zip validation). Revert both
+# this and continue_from_checkpoint below for any FUTURE fresh run from
+# scratch, same as opd_gated.yaml's equivalent note.
+name: "alfworld_opd_fullmemory"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true
+
+# Vanilla OPD, FULL-MEMORY variant: identical to opd.yaml (same plain
+# Qwen3-4B student / plain Qwen3-30B-A3B teacher pairing, same every length
+# limit) except default_workflow_type below points at
+# OPD_alfworld_workflow_fullmemory instead of OPD_alfworld_workflow --
+# the student sees the whole accumulated conversation each turn (growing
+# `memory` list of every past (user, assistant) pair) instead of a single
+# self-contained turn.
+#
+# Context: this exact full-memory design was tried once before with a
+# different (Instruct-2507) teacher and failed catastrophically --
+# prompt_length/clip_ratio of 0.52-0.67, 0/720 turns at eval ever emitted an
+# <action> tag, because the growing conversation silently truncated at
+# max_prompt_tokens=10240 over half the time, cutting off the model's own
+# formatting instructions. See OPD_workflow_fullmemory.py's module docstring
+# for the full writeup. This run deliberately does NOT raise any length
+# limit (max_prompt_tokens/max_response_tokens/max_token_len_per_gpu all
+# unchanged from opd.yaml) -- it instead tests whether swapping to the
+# plain (non-Instruct) Qwen3-30B-A3B teacher, which this session's zero-shot
+# evals showed behaves very differently from -Instruct-2507 (less prone to
+# rambling/verbose responses), keeps the student's own per-turn responses
+# short enough that the growing conversation doesn't blow the same budget.
+# If prompt_length/clip_ratio climbs anywhere near the earlier 0.52-0.67
+# figure again, that would indicate the original failure was intrinsic to
+# full-memory accumulation over long episodes regardless of teacher
+# identity, not specific to the -Instruct-2507 teacher's verbosity --watch
+# that metric early in training.
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_workflow_fullmemory.py
+# for the (full-memory) mechanism this runs, and OPD_workflow.py for the
+# capped-2-step sibling this is a deliberate variant of.
+#
+# total_steps raised from 250 to 500 (both buffer and trainer below) for a
+# wall-clock-matched rerun: the original 250-step run took 9.04h (130.2s/
+# step). The gated full-memory + reasoning-prompt variant
+# (opd_gated_fullmemory.yaml) took 16.33h for its own 250 steps (235.1s/
+# step, ~80% slower per step due to the extra per-turn teacher yes/no
+# consistency call). At vanilla's 130.2s/step, 500 steps ~= 18.1h, meeting
+# or exceeding gated's 16.33h total wall-clock budget -- lets us check an
+# intermediate checkpoint around step 450 (~16.3h) for an apples-to-apples
+# "same compute budget" comparison, isolating whether gating's edge (43.8%
+# pooled avg@4 at its own 250 steps / 16.33h) comes from the mechanism
+# itself or just from consuming more wall-clock time per step. (A wall-
+# clock-matched check at step 150 already showed gated and vanilla
+# statistically tied at ~9h: 36.8% vs. 37.1% pooled avg@4 -- this run tests
+# whether that holds at the larger ~16h budget too.)
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: same as opd.yaml -- plain Qwen/Qwen3-4B, enable_thinking=
+  # False. max_prompt_tokens/max_response_tokens deliberately UNCHANGED from
+  # opd.yaml (see module comment above) -- this run is testing the teacher-
+  # identity hypothesis, not a bigger context budget.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 500
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+    default_workflow_type: 'OPD_alfworld_workflow_fullmemory'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_fullmemory_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_fullmemory_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: same as opd.yaml -- plain Qwen/Qwen3-30B-A3B (no
+    # -Instruct-2507 suffix). max_model_len/max_prompt_tokens/
+    # max_response_tokens deliberately UNCHANGED (see module comment above).
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 500
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

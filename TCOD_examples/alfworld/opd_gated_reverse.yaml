@@ -1,0 +1,138 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_reverse"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Gated OPD, REVERSED-GATING control: same plain Qwen3-4B student / plain
+# Qwen3-30B-A3B teacher / full-memory / reasoning-before-answer yes/no
+# prompt as opd_gated_fullmemory.yaml, but default_workflow_type below
+# points at OPD_gated_alfworld_workflow_reverse instead of
+# OPD_gated_alfworld_workflow_fullmemory -- OPD is applied on turns where
+# the teacher says "Yes" (agrees with the student's action) instead of
+# turns where it says "No" (disagrees).
+#
+# Purpose: OPD_gated_workflow_random.py already showed that gating on a
+# random draw at the teacher-gated run's own measured apply-rate (32.7%)
+# badly underperforms the real teacher-gated run (avg@4 pooled 31.4% vs.
+# 43.8%, random even below the untrained 34.6% zero-shot baseline) --
+# establishing the teacher's judgment carries real signal, not just noise
+# at the right rate. This run asks a sharper question: does it matter
+# WHICH polarity gets corrected? Correcting disagreement turns (the
+# original design) pushes the student toward the teacher's preferred
+# action exactly where they diverge -- an error-correction signal.
+# Reversing it applies the OPD correction on turns where teacher and
+# student already agree, which is a qualitatively different signal
+# (closer to confirmation/regularization than correction). If reversed
+# gating underperforms the original, that supports "correcting
+# disagreement is where the value is." If it matches or beats the
+# original, the fraction/identity of gated turns may matter less than this
+# experiment's framing assumed.
+#
+# Expected gate-apply rate: ~67% (the complement of the original's ~32.7%,
+# since unparseable responses still default to "apply" in both variants --
+# see OPD_gated_workflow_reverse.py's module docstring for why that
+# fallback was kept identical rather than also reversed).
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_reverse.py
+# for the (reversed-gating) mechanism this runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_fullmemory.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the yes/no consistency check -- same as
+        # opd_gated_fullmemory.yaml (reasoning-before-answer prompt).
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+    default_workflow_type: 'OPD_gated_alfworld_workflow_reverse'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_reverse_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_reverse_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_fullmemory.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_fullmemory.yaml. Still called once per turn for logprobs
+    # scoring plus once per turn for the yes/no gate decision (as in the
+    # original gated workflow).
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

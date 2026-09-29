@@ -1,0 +1,174 @@
+project: "ALFWORLD_TCOD"
+# Reset back to a fresh-from-scratch run: base "alfworld_opd_gated" name
+# (config_validator.py auto-renames with a timestamp on launch since a
+# non-empty dir of this exact name already exists) and
+# continue_from_checkpoint=false. Was previously pointed at the completed
+# alfworld_opd_gated_20260921041437 run (see Run history below) to resume
+# and evaluate it; that run is done, so this reverts to a clean slate.
+name: "alfworld_opd_gated"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Gated OPD: identical to opd.yaml except default_workflow_type below and the
+# model paths (set to this project's 30B-A3B-Instruct-2507 teacher / 4B
+# student combination, per the request to try that pairing first). See
+# trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow.py's
+# docstring for the mechanism -- teacher only gets to apply its OPD
+# logprobs correction on turns where it says "No" to a yes/no consistency
+# check of the student's own action; turns where it says "Yes" train as
+# ordinary steps.
+#
+# Run history:
+# - A full 250-step run completed with the plain Qwen3-30B-A3B teacher
+#   revision (see OPD_gated_workflow.py's docstring for that run's bugs/
+#   fixes and alfworld_ts_probe/data/eval_opd_gated_step250.*.summary.json:
+#   unseen 21.6%, seen 17.9%).
+# - alfworld_opd_gated_20260921041437: a second full 250-step run with the
+#   teacher swapped to Qwen3-30B-A3B-Instruct-2507 (student stayed plain
+#   Qwen3-4B). Held-out eval under the trained-on 2-step/DASH-OPD protocol:
+#   unseen 19.4%, seen 17.9%, pooled 18.6%
+#   (eval_opd_gated_step250_final.*.summary.json). Also probed under a
+#   deliberately out-of-distribution full-memory eval protocol (growing
+#   conversation instead of the capped 2-step context it was trained on):
+#   pooled 39.4% (eval_opd_gated_step250_fullmemory.*.summary.json) -- more
+#   than double the trained-protocol number, and close to the zero-shot
+#   untrained student's own full-memory pooled result (37.6%), suggesting
+#   most of that uplift comes from memory access itself rather than OPD
+#   training. See also GitHub issue kokolerk/TCOD#4 comment 3 (paper author):
+#   the paper's actual teacher is the plain, no-suffix Qwen3-30B-A3B, not
+#   -Instruct-2507 -- zero-shot evals this session found the plain teacher
+#   scores higher under full memory too (42.7% pooled vs. -Instruct-2507's
+#   36.5%, closer to the paper's reported 39.57%). This file's teacher is
+#   still Qwen3-30B-A3B-Instruct-2507 (auxiliary_models[0] below) as of this
+#   revision -- only name/continue_from_checkpoint were reset here to start
+#   a fresh run; the plain-teacher revert was applied to opd.yaml (vanilla
+#   OPD) instead. Swap auxiliary_models[0].model_path here too if this
+#   gated variant should also use the paper-confirmed plain teacher.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain (bare) Qwen/Qwen3-4B, deliberately NOT the
+  # -Instruct-2507 revision. A gated run pairing -Instruct-2507 for BOTH
+  # teacher and student (alfworld_opd_gated_20260920150621) crashed at step
+  # 18 from Explorer starvation -- isolated via a 3-way wait_explore_step
+  # comparison (this run's own original plain/plain pace, ~400-640s/batch,
+  # vs a vanilla run with Instruct-2507 teacher + plain student, ~140-306s/
+  # batch [faster, not slower] vs that crashed gated run's ~882-1584s/batch)
+  # to be caused by the STUDENT swap, not the teacher swap -- present from
+  # step 1, before any training occurred. This config therefore keeps the
+  # plain student while retaining the Instruct-2507 teacher (below), to
+  # test the teacher swap in isolation.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the new per-turn yes/no consistency check specifically
+        # (independent of the OPD logprobs-scoring temperature above, and of
+        # rollout_args.temperature used for the student's own sampling).
+        # Greedy by default -- see OPD_gated_workflow.py's rationale.
+        consistency_temperature: 0.0
+        # 16 was tried first and was too tight: a live run showed
+        # consistency_parse_success_rate of only ~5-7% (opd_gate_apply_rate
+        # sat at 96-99%, but that was almost entirely unparseable responses
+        # defaulting to "apply", not genuine teacher "No" answers) --
+        # consistency_response_length_mean (~59-61 chars) matched almost
+        # exactly what 16 tokens allows, indicating responses were getting
+        # cut off before completing the closing </answer> tag even without
+        # rambling. Raised to 512 for comfortable headroom while still far
+        # below the original 4096 that caused the rambling/timeout crash.
+        consistency_max_tokens: 512
+    default_workflow_type: 'OPD_gated_alfworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 (not the original template's 2/2)
+    # -- the 4B student comfortably fits on a single GPU each, so 2 replicas
+    # (2 concurrent generation streams) cost only 2 GPUs, not 4. The 30B-A3B
+    # teacher's fixed 4-GPU requirement (below) leaves limited room for
+    # rollout once the Trainer's own GPU share is accounted for (see
+    # config_validator.py's _set_gpu_allocation_info: Explorer
+    # (rollout + teacher) and Trainer use DISJOINT GPUs, and Explorer must
+    # be strictly less than the total: 2+4=6 < 8, leaving trainer_gpu_num=2).
+    # trainer_gpu_num must also evenly divide buffer.train_batch_size (64) --
+    # 2 does; 3 (from the earlier engine_num=1 attempt) doesn't, which is
+    # what the "batch_size (64) must be divisible by (3)" error meant.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: Qwen/Qwen3-30B-A3B-Instruct-2507
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

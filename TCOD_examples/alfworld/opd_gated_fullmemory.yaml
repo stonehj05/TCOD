@@ -1,0 +1,170 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_fullmemory"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Gated OPD, FULL-MEMORY + plain-teacher variant: two changes from
+# opd_gated.yaml at once --
+#   1. Teacher swapped to plain Qwen/Qwen3-30B-A3B (no -Instruct-2507
+#      suffix) -- GitHub issue kokolerk/TCOD#4 comment 3 (paper author)
+#      confirms this is the paper's actual teacher, and this session's
+#      zero-shot evals found it scores higher under full memory too (avg@4
+#      pooled 41.0% vs. -Instruct-2507's 36.9%).
+#   2. default_workflow_type below points at
+#      OPD_gated_alfworld_workflow_fullmemory instead of
+#      OPD_gated_alfworld_workflow -- the student (and the teacher's yes/no
+#      consistency check) see the whole accumulated conversation each turn,
+#      growing `memory` list, instead of a single self-contained turn.
+#
+# Context: the ORIGINAL gated design (before OPD_gated_workflow.py's fix)
+# was full-memory and failed catastrophically with the -Instruct-2507
+# teacher -- prompt truncation at max_prompt_tokens=10240, "Error parsing
+# action: list index out of range" spam. See
+# OPD_gated_workflow_fullmemory.py's and OPD_workflow_fullmemory.py's module
+# docstrings for the fuller writeup. This run deliberately does NOT raise
+# any length limit (max_prompt_tokens/max_response_tokens/
+# max_token_len_per_gpu/consistency_max_tokens all unchanged from
+# opd_gated.yaml) -- testing whether the plain teacher's less rambly
+# behavior alone avoids the original failure mode. Watch
+# prompt_length/clip_ratio early in training: opd_fullmemory.yaml's own run
+# (vanilla, same plain teacher) kept it in the 0.15-0.44 range (vs. 0.52-0.67
+# for the original -Instruct-2507 full-memory failure) -- real truncation,
+# not eliminated, but survivable. This run additionally has the yes/no
+# consistency call itself now also seeing the growing conversation (see
+# OPD_gated_workflow_fullmemory.py's _ask_teacher_yes_no), which the vanilla
+# variant has no equivalent of -- an extra, gated-specific source of prompt
+# growth worth watching for.
+#
+# Prior gated results for context (all avg@4, full-memory EVAL protocol
+# regardless of training protocol):
+#   - Gated, 2-step-trained, -Instruct-2507 teacher: pooled 40.0% (+-1.7%)
+#     -- the strongest trained checkpoint measured so far, above the
+#     untrained 4B student baseline (34.6%) and above its own teacher's
+#     avg@4 (36.9%).
+#   - Vanilla, full-memory-trained, plain teacher: pooled 37.1% (+-1.4%)
+#   - Vanilla, 2-step-trained, plain teacher: pooled 32.1% (+-1.1%)
+# This run tests whether combining full-memory training AND the
+# paper-confirmed plain teacher, on top of the gating mechanism, pushes
+# gated OPD higher still, or whether (as with vanilla OPD) full-memory
+# training just converges toward the zero-shot baseline.
+#
+# RESULT of the above run (plain teacher + full memory + gated, bare
+# yes/no addendum): avg@4 pooled 32.1% (+-1.3%) -- essentially identical to
+# vanilla OPD's own plain/2-step number, and BELOW the untrained zero-shot
+# baseline (34.6%). Neither the plain-teacher swap nor full-memory training
+# individually helped the gated mechanism replicate its earlier win.
+#
+# NEXT test: OPD_gated_workflow_fullmemory.py's YES_NO_ADDENDUM has now been
+# reverted to the ORIGINAL alfworld_ts_probe/05_teacher_consistency.py
+# wording (brief reasoning before the answer) instead of the bare
+# yes/no-only version OPD_gated_workflow.py had tightened to specifically to
+# stop the -Instruct-2507 teacher from rambling. Since this file's teacher
+# is the plain (non-Instruct) Qwen3-30B-A3B -- shown throughout this
+# session's zero-shot evals to be much less prone to open-ended rambling --
+# this tests whether the plain teacher tolerates reasoning-before-answer
+# fine, in which case the earlier no-reasoning constraint wasn't needed for
+# it and may have been suppressing useful signal. consistency_max_tokens
+# below deliberately left at 512 (not reverted to the probe script's 4096)
+# as a safety backstop regardless of outcome. NOT YET RE-RUN with this
+# prompt change -- the RESULT above is from the prior (bare yes/no) prompt.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: same as opd_gated.yaml -- plain Qwen/Qwen3-4B.
+  # max_prompt_tokens/max_response_tokens deliberately UNCHANGED (see module
+  # comment above).
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the yes/no consistency check -- same as opd_gated.yaml.
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+    default_workflow_type: 'OPD_gated_alfworld_workflow_fullmemory'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_fullmemory_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_fullmemory_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: swapped to plain Qwen/Qwen3-30B-A3B (no -Instruct-2507
+    # suffix) -- see module comment above. max_model_len/max_prompt_tokens/
+    # max_response_tokens deliberately UNCHANGED from opd_gated.yaml.
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

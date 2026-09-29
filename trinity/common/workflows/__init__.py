@@ -56,6 +56,12 @@ WORKFLOWS: Registry = Registry(
         # custom workflows
         "sudoku_workflow": "trinity.common.workflows.envs.sudoku.sudoku_workflow.SudokuWorkflow",
         "OPD_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.OPD_workflow.OnPolicyDistillVerlAgentAlfworldWorkflow",
+        "OPD_alfworld_workflow_fullmemory": "trinity.common.workflows.envs.TCOD.alfworld.OPD_workflow_fullmemory.OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory",
+        "OPD_gated_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow.OPDGatedAlfworldWorkflow",
+        "OPD_gated_alfworld_workflow_fullmemory": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_fullmemory.OPDGatedAlfworldWorkflowFullMemory",
+        "OPD_gated_alfworld_workflow_random": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_random.OPDGatedAlfworldWorkflowRandom",
+        "OPD_gated_alfworld_workflow_reverse": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_reverse.OPDGatedAlfworldWorkflowReverse",
+        "OPD_gated_alfworld_workflow_lookahead": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_lookahead.OPDGatedAlfworldWorkflowLookahead",
         "TCOD_f2b_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_f2b_workflow.TCOD_f2b_alfworld_workflow",
         "TCOD_b2f_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow.TCOD_b2f_alfworld_workflow",
         "OPD_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",

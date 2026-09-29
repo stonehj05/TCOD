@@ -1,0 +1,151 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_lookahead"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Gated OPD, LOOK-AHEAD-GATING variant: same plain Qwen3-4B student / plain
+# Qwen3-30B-A3B teacher / full-memory setup as opd_gated_fullmemory.yaml,
+# but default_workflow_type below points at
+# OPD_gated_alfworld_workflow_lookahead instead of
+# OPD_gated_alfworld_workflow_fullmemory -- the gate is no longer "would the
+# teacher have taken this single action" but "does the teacher think the
+# next 5-step window (starting at and including the current step) shows
+# genuine progress toward the task goal". OPD is applied at step t only if
+# the teacher says that window is NOT progress (or the answer is
+# unparseable). For the trajectory's final 5 steps -- where a full forward
+# window can't be formed -- there is no teacher call at all: OPD is applied
+# if the episode eventually failed, skipped if it succeeded.
+#
+# Purpose: OPD_gated_workflow_fullmemory.py's single-step "would you have
+# taken this action" gate, and its random/reverse controls, all decide
+# apply/skip from a purely backward-looking, single-action judgment. This
+# run asks a different question: can a forward-looking, multi-step
+# "is this stretch of the rollout unproductive" signal serve as a better
+# (or at least a meaningfully different) correction trigger than agreement
+# with a single action? Reuses the exact prompt convention already
+# validated offline in alfworld_ts_probe/06_progress_probe.py (see that
+# script's progress_probe_summary.json for known precision/recall/F1 against
+# final trajectory success -- worth reading before interpreting results
+# here, since that offline study found only ~60% accuracy predicting final
+# outcome from a single random window, barely above the ~61% base rate of
+# just guessing "failed").
+#
+# Architecture: unlike every other gated variant, this workflow cannot
+# decide a step's gate inline as it's generated (deciding step t needs
+# steps t+1..t+4, which don't exist yet at that point). It runs the full
+# rollout first, then walks back over every step once the outcome is known.
+# See OPD_gated_workflow_lookahead.py's module docstring for the full
+# three-pass design and the accepted prompt-length-growth tradeoff (each of
+# the ~N-5 windowed teacher calls per trajectory extends the full growing
+# memory through the end of its window, same full-context convention as the
+# existing yes/no check, just repeated many more times per trajectory).
+#
+# Expected gate-apply rate: unknown going in -- this is the open empirical
+# question this run is meant to answer, not something extrapolated from a
+# prior run the way the random/reverse controls' expectations were.
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_lookahead.py
+# for the (look-ahead-gated) mechanism this runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_fullmemory.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the windowed progress-judgment call (reasoning-before-
+        # answer prompt, same convention as consistency_temperature/
+        # consistency_max_tokens in the other gated variants).
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        progress_window_size: 5
+    default_workflow_type: 'OPD_gated_alfworld_workflow_lookahead'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_lookahead_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_lookahead_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_fullmemory.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_fullmemory.yaml. Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory,
+    # rather than once per step as in the single-step consistency check).
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

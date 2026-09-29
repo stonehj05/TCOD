@@ -100,7 +100,7 @@ def create_dataset_files(output_dir, train_task_names, test_task_names, jar_path
 
 if __name__ == "__main__":
     # NOTE: Mannually set the jar path here.
-    jar_path = "/your/path/ScienceWorld/scienceworld/scienceworld.jar"
+    jar_path = "/data/hs2352/LookAheadOPD/ScienceWorld/scienceworld/scienceworld.jar"
     # Check if the jar file exists, raise an error if it doesn't exist.
     if not os.path.exists(jar_path):
         raise FileNotFoundError(

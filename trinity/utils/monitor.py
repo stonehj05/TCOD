@@ -179,6 +179,25 @@ class WandbMonitor(Monitor):
             os.environ["WANDB_BASE_URL"] = base_url
         if api_key := monitor_args.get("api_key"):
             os.environ["WANDB_API_KEY"] = api_key
+
+        # Persist the wandb run id per role (explorer/trainer) inside the
+        # checkpoint dir, and reuse it on a continue_from_checkpoint resume
+        # -- without an explicit id+resume, wandb.init() always creates a
+        # brand-new run, so every resumed job used to start a disconnected
+        # plot even when the checkpoint itself resumed correctly (these are
+        # independent subsystems; see also verl's own separate
+        # latest_checkpointed_iteration.txt marker for the analogous
+        # checkpoint-side issue). id_file lives outside the per-role
+        # tensorboard/etc dirs so it survives independently of any one
+        # monitor backend.
+        run_id = None
+        id_file = None
+        if config is not None and getattr(config, "checkpoint_job_dir", None):
+            id_file = os.path.join(config.checkpoint_job_dir, f"wandb_run_id_{role}.txt")
+            if config.continue_from_checkpoint and os.path.exists(id_file):
+                with open(id_file) as f:
+                    run_id = f.read().strip() or None
+
         self.logger = wandb.init(
             project=project,
             group=group,
@@ -186,7 +205,15 @@ class WandbMonitor(Monitor):
             tags=[role],
             config=config,
             save_code=False,
+            id=run_id,
+            resume="allow" if run_id else None,
         )
+
+        if id_file and not run_id:
+            os.makedirs(os.path.dirname(id_file), exist_ok=True)
+            with open(id_file, "w") as f:
+                f.write(self.logger.id)
+
         self.console_logger = get_logger(__name__, in_ray_actor=True)
 
     def log_table(self, table_name: str, experiences_table: pd.DataFrame, step: int):

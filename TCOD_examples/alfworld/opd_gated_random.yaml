@@ -1,0 +1,145 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_random"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Gated OPD, RANDOM-GATING CONTROL: same plain Qwen3-4B student / plain
+# Qwen3-30B-A3B teacher / full-memory setup as opd_gated_fullmemory.yaml,
+# but default_workflow_type below points at
+# OPD_gated_alfworld_workflow_random instead of
+# OPD_gated_alfworld_workflow_fullmemory -- there is NO teacher yes/no call
+# at all; which turns get the OPD correction is decided by an independent
+# random draw at a FIXED rate (RANDOM_APPLY_RATE = 0.327 in
+# OPD_gated_workflow_random.py), matching the measured overall apply-rate
+# from the teacher-gated reasoning-prompt run
+# (alfworld_opd_gated_fullmemory_20260924145239: mean 32.7% across its full
+# 250-step run, n=175, std 5.4pp).
+#
+# Purpose: that teacher-gated run reached avg@4 pooled 43.8% (+-2.2%) at 250
+# steps / 16.33h -- clearly ahead of vanilla OPD's own step-250 number
+# (37.1%), though a wall-clock-matched vanilla rerun to ~16h (step 450/500)
+# came back statistically tied (42.3-43.8%, see opd_fullmemory.yaml's own
+# RESULT notes). This run isolates a further, orthogonal question: within
+# the gated MECHANISM itself (same ~1/3-of-turns-get-OPD structure, same
+# extra wall-clock cost from computing per-turn gate decisions), does the
+# teacher's actual judgment about WHICH turns to gate matter, or would
+# randomly gating the same FRACTION of turns produce a similar result? If
+# random gating matches the teacher-gated run, the earlier win is better
+# explained by "roughly 1/3 of turns get an OPD correction, 2/3 train as
+# ordinary steps" as a training-dynamics effect (e.g. an implicit KL-
+# regularization schedule or effective-batch-composition change), not by
+# the teacher correctly targeting turns that most need correction. If random
+# gating clearly underperforms the teacher-gated run, that's evidence the
+# teacher's per-turn verdict carries real, non-random signal.
+#
+# Side effect worth noting: removing the teacher yes/no call also removes
+# its latency cost entirely (no consistency_temperature/max_tokens config
+# needed here, and none of the consistency_parse_success_rate /
+# consistency_response_length_* metrics apply) -- this run should train at
+# close to vanilla OPD's own per-step pace (~130s/step), not the reasoning-
+# prompt gated run's ~235s/step, since the teacher is still called once per
+# turn for logprobs scoring (as in ungated OPD) but never for an extra
+# generation call. Compare actual measured per-step time once this has run
+# a few steps to confirm.
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_random.py
+# for the (random-gating) mechanism this runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_fullmemory.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # No consistency_temperature/consistency_max_tokens here -- there is
+        # no teacher yes/no call in this workflow (see module docstring).
+    default_workflow_type: 'OPD_gated_alfworld_workflow_random'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_random_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_random_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_fullmemory.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_fullmemory.yaml. Still called once per turn for logprobs
+    # scoring (as in ungated OPD) -- just never for an extra gating-decision
+    # generation call.
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb
