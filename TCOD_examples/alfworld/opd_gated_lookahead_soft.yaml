@@ -1,0 +1,157 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_lookahead_soft"
+checkpoint_root_dir: ./checkpoints
+# Flipped to true to resume training from the existing global_step_25
+# checkpoint (paused after its save completed to free GPUs for a standalone
+# Qwen3-1.7B zero-shot eval) -- verl auto-detects the latest checkpoint
+# under checkpoint_job_dir (trinity/common/verl_config.py: resume_mode =
+# "auto" when this is true) and picks up from there. No other field needs
+# to change; the run name/checkpoint dir are unchanged so it resumes the
+# SAME experiment rather than starting a fresh timestamped one (which is
+# what happens if this were left false while the directory already has
+# content -- see config_validator.py's rename-on-conflict logic).
+continue_from_checkpoint: true
+
+# Gated OPD, LOOK-AHEAD, SOFT-WEIGHTED variant: same plain Qwen3-4B student /
+# plain Qwen3-30B-A3B teacher / full-memory setup as opd_gated_lookahead.yaml,
+# but default_workflow_type below points at
+# OPD_gated_alfworld_workflow_lookahead_soft instead of
+# OPD_gated_alfworld_workflow_lookahead -- windowed steps the teacher judges
+# as showing progress are DOWNWEIGHTED (correction strength scaled by
+# progress_downweight_factor, default 0.5) instead of excluded outright.
+# Steps where the teacher says NOT progress (or the answer is unparseable)
+# still get full-strength correction. The trajectory's final
+# progress_window_size steps are unchanged from the hard variant: full
+# correction on failure, none on success -- see
+# OPD_gated_workflow_lookahead_soft.py's module docstring for why that part
+# isn't softened (it's ground truth, not a teacher judgment).
+#
+# Purpose: OPD_gated_workflow_lookahead.py's hard version underperformed
+# both the original single-step-gated design AND vanilla (ungated) OPD at
+# the same step budget (avg@4 pooled 38.2% vs. 43.8% / 42.3%), despite
+# clearly beating the random/reverse negative controls (31.4% / 32.2%) --
+# so the look-ahead progress signal carries real information, it's just
+# being used too bluntly. This asks whether hard-excluding an entire
+# 5-step window whenever the teacher says "progress" throws away a
+# correction signal that's still partially useful -- keeping it at reduced
+# strength instead of zeroing it may recover some of what the hard version
+# lost without sacrificing the ability to still push harder on windows the
+# teacher flags as unproductive.
+#
+# Implementation note: this required NO changes to the shared advantage
+# function (trinity/algorithm/advantage_fn/on_policy_distill_advantage.py)
+# -- the weight is baked directly into what gets stored as
+# response.teacher_logprobs (blended toward the student's own logprob by
+# the weight), not into teacher_logprobs_valid_mask, which is a boolean
+# mask that would have silently truncated 0.5 to True. See
+# OPD_gated_workflow_lookahead_soft.py's module docstring for the full
+# explanation.
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_lookahead_soft.py
+# for the (soft-weighted, look-ahead-gated) mechanism this runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_lookahead.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the windowed progress-judgment call -- same as
+        # opd_gated_lookahead.yaml (reasoning-before-answer prompt).
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        progress_window_size: 5
+        # Correction-strength multiplier applied to windowed steps the
+        # teacher judges as showing progress (1.0 = no softening, i.e. the
+        # hard variant's "skip" case; 0.0 = fully excluded, i.e. identical
+        # to the hard variant everywhere).
+        progress_downweight_factor: 0.5
+    default_workflow_type: 'OPD_gated_alfworld_workflow_lookahead_soft'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_lookahead_soft_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_lookahead_soft_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_lookahead.yaml. Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory).
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

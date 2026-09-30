@@ -1,0 +1,141 @@
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_tpu_repro_1.7b_8b"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Small-scale vanilla-OPD reference run, purpose-built as a correctness
+# target for a from-scratch TPU reimplementation of this pipeline -- NOT
+# part of the gated-OPD comparison study (opd_fullmemory.yaml /
+# opd_gated_*.yaml). Deliberately smaller/cheaper on every axis that isn't
+# load-bearing for correctness checking:
+#   - Student Qwen/Qwen3-1.7B, teacher Qwen/Qwen3-8B (vs. this project's
+#     usual Qwen3-4B / Qwen3-30B-A3B pairing) -- both dense models, so a
+#     TPU port doesn't also have to get MoE routing right before this
+#     number becomes checkable.
+#   - 100 steps total (vs. 250+ elsewhere).
+#   - monitor_type: tensorboard, not wandb -- purely local logs, no
+#     external account/API key needed to reproduce this on another
+#     machine. Metrics still print to trainer.log/explorer.log console
+#     output either way (see TensorboardMonitor.log in
+#     trinity/utils/monitor.py), so nothing about visibility into
+#     training is actually lost.
+#
+# Workflow: OPD_alfworld_workflow_fullmemory -- the SAME full-memory
+# vanilla-OPD design used as the baseline throughout this project's gated-
+# OPD comparison study (see opd_fullmemory.yaml), not the older single-turn
+# OPD_alfworld_workflow. Picked deliberately so this reference number's
+# workflow mechanics (growing multi-turn `memory`, per-turn teacher-logprob
+# scoring, no gating) match what's actually being reimplemented on TPU.
+#
+# GPU allocation (8 GPUs total, single node): rollout engine_num=3,
+# tensor_parallel_size=1 (3 GPUs -- more replicas than the usual engine_num=2
+# since the 1.7B student is small enough to make that cheap and it speeds up
+# rollout collection); teacher engine_num=1, tensor_parallel_size=1 (1 GPU --
+# an 8B dense model comfortably fits on a single GPU here, unlike the usual
+# 30B-A3B teacher's tensor_parallel_size=4). Explorer total = 4 GPUs,
+# leaving trainer_gpu_num = 8 - 4 = 4 (evenly divides train_batch_size=64).
+# Adjust engine_num/tensor_parallel_size if your GPU memory class differs.
+#
+# See trinity/common/workflows/envs/TCOD/alfworld/OPD_workflow_fullmemory.py
+# for the (ungated, full-memory) mechanism this runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: Qwen/Qwen3-1.7B -- smaller than this project's usual
+  # Qwen3-4B student, chosen for a fast, cheap TPU-parity reference run.
+  model_path: Qwen/Qwen3-1.7B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 100
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+    default_workflow_type: 'OPD_alfworld_workflow_fullmemory'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_tpu_repro_1.7b_8b_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_tpu_repro_1.7b_8b_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=3, tensor_parallel_size=1 -- 3 GPUs. The 1.7B student is
+    # small enough that more concurrent-generation replicas are cheap.
+    engine_num: 3
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: Qwen/Qwen3-8B, dense -- comfortably fits on a single
+    # GPU here (unlike the usual 30B-A3B teacher's tensor_parallel_size=4).
+    - model_path: Qwen/Qwen3-8B
+      engine_num: 1
+      tensor_parallel_size: 1
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 100
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  # Local TensorBoard logs only -- no wandb account/API key needed. Logs
+  # under checkpoints/ALFWORLD_TCOD/alfworld_opd_tpu_repro_1.7b_8b/monitor/
+  # (see config.monitor.cache_dir in trinity/utils/monitor.py). Every
+  # metric also still prints to trainer.log/explorer.log regardless.
+  monitor_type: tensorboard
