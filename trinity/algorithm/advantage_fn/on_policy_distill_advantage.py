@@ -12,10 +12,14 @@ For multi-turn workflows (OPD_alfworld_workflow, OPD_scienceworld_workflow, etc.
 """
 
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
-from verl import DataProto
+
+try:
+    from verl import DataProto
+except ImportError:  # TPU env (trainer_type: tunix) has no verl; only used in type hints
+    DataProto = Any
 
 from trinity.algorithm.advantage_fn.advantage_fn import AdvantageFn
 

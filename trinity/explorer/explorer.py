@@ -390,7 +390,9 @@ class Explorer:
             await asyncio.gather(*run_api_ref)
             self.logger.info("All models are ready.")
 
-            if not self.use_nccl_sync and self.model_type != "tinker":
+            # vllm_tpu engines load the published checkpoint path themselves
+            # (vllm_tpu_worker.py), so no explorer-internal NCCL group is needed.
+            if not self.use_nccl_sync and self.model_type not in ("tinker", "vllm_tpu"):
                 if self.config.mode == "serve":
                     # In serving mode, each engine will setup its own process group
                     await self.setup_model_level_weight_sync_group()

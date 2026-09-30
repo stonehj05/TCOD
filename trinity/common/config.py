@@ -738,6 +738,10 @@ class TrainerConfig:
     ] = None  # total training steps, training stops when reaching this step, None means no limit
 
     save_hf_checkpoint: str = "last"  # whether to save checkpoint in HuggingFace format
+    # tunix trainer only: root for the per-step weight-sync checkpoints (e.g. a tmpfs such as
+    # /dev/shm/tcod_sync, visible at the same path on every node). Full checkpoints still go
+    # to checkpoint_job_dir. None = write sync checkpoints to checkpoint_job_dir as well.
+    sync_checkpoint_dir: Optional[str] = None
     # "always": save all checkpoints in HF format
     # "never": never save checkpoint in HF format
     # "last": only save the last checkpoint in HF format

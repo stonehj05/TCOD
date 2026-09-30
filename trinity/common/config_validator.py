@@ -1107,6 +1107,13 @@ class TrainerConfigValidator(ConfigValidator):
             config.trainer.trainer_config.synchronize_config(config)
         elif config.trainer.trainer_type == "tinker":
             config.trainer.trainer_config = None
+        elif config.trainer.trainer_type == "tunix":
+            # TPU trainer (trinity/trainer/tunix_trainer.py): JAX, checkpoint weight sync.
+            config.trainer.trainer_config = None
+            if config.synchronizer.sync_method != SyncMethod.CHECKPOINT:
+                raise ValueError("trainer_type 'tunix' requires synchronizer.sync_method: checkpoint")
+            if config.explorer.rollout_model.engine_type != "vllm_tpu":
+                raise ValueError("trainer_type 'tunix' requires explorer.rollout_model.engine_type: vllm_tpu")
         else:
             raise ValueError(f"Invalid trainer type: {config.trainer.trainer_type}")
 

@@ -1,0 +1,17 @@
+# Tiny end-to-end check on one host: 0.5B student, 1.5B teacher.
+student: Qwen/Qwen2.5-0.5B-Instruct
+teacher: Qwen/Qwen2.5-1.5B-Instruct
+train_file: ../TCOD_examples/alfworld/alfworld_data/train.jsonl
+eval_file: ../TCOD_examples/alfworld/alfworld_data/test.jsonl
+game_path_prefix_from: /data/hs2352/LookAheadOPD/alf-data/
+game_path_prefix_to: /home/haojun_shi/alf-data/
+batch_size: 4
+max_env_steps: 4
+max_response_tokens: 256
+total_steps: 3
+mini_batch_size: 8
+micro_batch_size: 2
+lr: 1.0e-6
+eval_interval: 3
+eval_episodes: 4
+log_dir: ./logs/smoke

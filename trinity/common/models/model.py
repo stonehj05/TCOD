@@ -515,6 +515,10 @@ class ModelWrapper:
             setattr(self.openai_client, "model_path", self.model_path)
             return self.openai_client
         if not self.api_address:
+            if self.engine_type == "vllm_tpu":
+                # vLLM-TPU engines run without the OpenAI server; workflows that only use
+                # the wrapper (e.g. OPD teachers via logprobs_async) don't need a client.
+                return None
             raise ValueError(
                 "API server is not enabled for this model. OpenAI client is unavailable."
             )
@@ -574,6 +578,10 @@ class ModelWrapper:
             setattr(self.openai_async_client, "model_path", self.model_path)
             return self.openai_async_client
         if not self.api_address:
+            if self.engine_type == "vllm_tpu":
+                # vLLM-TPU engines run without the OpenAI server; workflows that only use
+                # the wrapper (e.g. OPD teachers via logprobs_async) don't need a client.
+                return None
             raise ValueError(
                 "API server is not enabled for this model. OpenAI async client is unavailable."
             )

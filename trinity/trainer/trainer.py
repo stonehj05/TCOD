@@ -276,5 +276,9 @@ def get_trainer_wrapper(config: Config) -> TrainEngineWrapper:
         from trinity.trainer.tinker_trainer import TinkerTrainerWrapper
 
         return TinkerTrainerWrapper(config)
+    elif config.trainer.trainer_type == "tunix":
+        from trinity.trainer.tunix_trainer import TunixTrainerWrapper
+
+        return TunixTrainerWrapper(config)
     else:
         raise NotImplementedError

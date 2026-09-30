@@ -90,6 +90,8 @@ class Synchronizer:
             await self._find_verl_latest_state_dict()
         elif self.config.trainer.trainer_type == "tinker":
             await self._find_tinker_latest_state_dict()
+        elif self.config.trainer.trainer_type == "tunix":
+            await self._find_tunix_latest_state_dict()
         else:
             self.logger.warning(
                 "Synchronizer does not support this trainer type. Please use `verl` or `tinker`."
@@ -142,6 +144,39 @@ class Synchronizer:
                     f"Removing previous checkpoint for sync at step {previous_model_version}."
                 )
                 shutil.rmtree(previous_state_dict_dir, ignore_errors=True)
+
+    async def _find_tunix_latest_state_dict(self) -> None:
+        """TPU trainer: the state-dict payload is the path of a HF safetensors checkpoint,
+        loaded in place by the vLLM-TPU engines (see vllm_tpu_worker.py)."""
+        from trinity.trainer.tunix_trainer import sync_checkpoint_dir, sync_checkpoint_root
+
+        latest_file = os.path.join(self.config.checkpoint_job_dir, "latest_state_dict_iteration.txt")
+        while True:
+            if os.path.exists(latest_file):
+                current_model_version = self.model_version
+                try:
+                    with open(latest_file, "r") as f:
+                        latest_model_version = int(f.read().strip())
+                except (IOError, ValueError) as e:
+                    self.logger.warning(f"Failed to read or parse state dict iteration file: {e}")
+                    latest_model_version = current_model_version
+                if latest_model_version > current_model_version:
+                    path = sync_checkpoint_dir(self.config, latest_model_version)
+                    self.logger.info(f"Synchronizer has found a new HF checkpoint at {path}.")
+                    await self.set_model_state_dict(path, latest_model_version)
+                    if self.config.trainer.sync_checkpoint_dir:
+                        # Engines may still be loading `current_model_version`; everything
+                        # older is superseded. Full checkpoints live elsewhere (on disk).
+                        root = sync_checkpoint_root(self.config)
+                        for d in os.listdir(root):
+                            step = d.rsplit("_", 1)[-1]
+                            if d.startswith("global_step_") and step.isdigit() and int(step) < current_model_version:
+                                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                    else:
+                        # The explorer loads new weights before older sync-only checkpoints
+                        # are removed; keep one version of slack for engines still loading.
+                        await self._remove_previous_state_dict(current_model_version - 1)
+            await asyncio.sleep(1)
 
     async def _find_tinker_latest_state_dict(self) -> None:
         default_local_dir = self.config.checkpoint_job_dir

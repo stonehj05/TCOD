@@ -50,6 +50,8 @@ def create_inference_models(
     tensor_parallel_size = config.explorer.rollout_model.tensor_parallel_size
 
     rollout_engines = []
+    if config.explorer.rollout_model.engine_type == "vllm_tpu":
+        return _create_tpu_inference_models(config)
     if config.explorer.rollout_model.engine_type.startswith("vllm"):
         from trinity.common.models.vllm_model import vLLMRolloutModel
 
@@ -173,6 +175,56 @@ def create_inference_models(
             )
         auxiliary_engines.append(engines)
 
+    return rollout_engines, auxiliary_engines
+
+
+def _create_tpu_inference_models(
+    config: Config,
+) -> Tuple[List[InferenceModel], List[List[InferenceModel]]]:
+    """vLLM-TPU engines: one Ray actor per engine holding `tensor_parallel_size` TPU chips.
+
+    Ray exposes TPU chips as the `TPU` resource and sets TPU_VISIBLE_CHIPS for
+    the actor, so each engine (and the TPU trainer) gets disjoint chips.
+    """
+    import ray
+
+    from trinity.common.models.vllm_tpu_model import vLLMTPURolloutModel
+
+    namespace = config.ray_namespace
+    # Multi-host: if some nodes were started with `--resources '{"explorer_tpu": N}'`,
+    # keep engines on those nodes so the trainer's host keeps its chips free.
+    pin = "explorer_tpu" in ray.cluster_resources()
+
+    def launch(model_config, name):
+        model_config.ray_namespace = namespace
+        resources = {"TPU": model_config.tensor_parallel_size}
+        if pin:
+            resources["explorer_tpu"] = model_config.tensor_parallel_size
+        return (
+            ray.remote(vLLMTPURolloutModel)
+            .options(
+                name=name,
+                num_cpus=0,
+                resources=resources,
+                namespace=namespace,
+            )
+            .remote(config=model_config)
+        )
+
+    rollout_config = config.explorer.rollout_model
+    rollout_engines = [
+        launch(rollout_config, f"{config.explorer.name}_rollout_model_{i}")
+        for i in range(rollout_config.engine_num)
+    ]
+    auxiliary_engines = []
+    for i, model_config in enumerate(config.explorer.auxiliary_models):
+        model_config.engine_type = "vllm_tpu"
+        auxiliary_engines.append(
+            [
+                launch(model_config, f"{config.explorer.name}_auxiliary_model_{i}_{j}")
+                for j in range(model_config.engine_num)
+            ]
+        )
     return rollout_engines, auxiliary_engines
 
 
