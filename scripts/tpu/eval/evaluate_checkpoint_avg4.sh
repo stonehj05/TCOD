@@ -6,11 +6,13 @@
 # The work is cut into jobs of one (rep, split, part) each, one vLLM-TPU server per chip:
 # with C chips in total, each split is cut into PARTS = max(1, C / (2 * N_REPS)) parts, and the
 # jobs run in waves of C. Games are independent, so the parts are merged back into the usual
-# per-rep files eval_<LABEL>.rep<R>.<split>.{jsonl,summary.json} (written to $PROBE_DIR/data)
-# and aggregated as mean +/- std over reps. Verified on 16 chips (4 VMs x 4): ~12 min.
+# per-rep files eval_<LABEL>.rep<R>.<split>.{jsonl,summary.json} (written to $RESULT_DIR,
+# default $REPO/checkpoints/eval_results) and aggregated as mean +/- std over reps.
+# Verified on 16 chips (4 VMs x 4): ~12 min.
 #
-# Requires $PROBE_DIR (see run_eval_job.sh) and a directory visible at the same path on all
-# workers for the part files ($OUT_ROOT, default $REPO/checkpoints/eval_runs = the NFS share).
+# Uses the evaluation client in client/ (override with $PROBE_DIR) and a directory visible at
+# the same path on all workers for the part files ($OUT_ROOT, default
+# $REPO/checkpoints/eval_runs = the NFS share).
 # The model path must also be readable from every worker (a checkpoint under
 # $REPO/checkpoints is; a Hugging Face repo id works too).
 #
@@ -22,14 +24,15 @@ N_REPS=${N_REPS:-4}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO=${REPO:-$HOME/TCOD}
 VENV=${VENV:-$HOME/venv-vllm-tpu}
-PROBE_DIR=${PROBE_DIR:-$HOME/alfworld_ts_probe}
+PROBE_DIR=${PROBE_DIR:-$HERE/client}
+RESULT_DIR=${RESULT_DIR:-$REPO/checkpoints/eval_results}
 TASK_DIR=${TASK_DIR:-$HOME/alf-data/tcod_tasks}
 OUT_ROOT=${OUT_ROOT:-$REPO/checkpoints/eval_runs}
 PY=$VENV/bin/python
 SSH="ssh -i ${SSH_KEY:-$HOME/.ssh/google_compute_engine} -o BatchMode=yes"
 OUT_DIR=$OUT_ROOT/$LABEL
-mkdir -p "$OUT_DIR" "$PROBE_DIR/data"
-[ -f "$PROBE_DIR/12_evaluate_checkpoint.py" ] || { echo "missing $PROBE_DIR/12_evaluate_checkpoint.py (see run_eval_job.sh)" >&2; exit 1; }
+mkdir -p "$OUT_DIR" "$RESULT_DIR"
+[ -f "$PROBE_DIR/12_evaluate_checkpoint.py" ] || { echo "missing $PROBE_DIR/12_evaluate_checkpoint.py" >&2; exit 1; }
 
 # Workers: $WORKER_IPS ("ip0 ip1 ..."), else TPU-VM metadata, else just this VM.
 md() { curl -sf -m 5 -H Metadata-Flavor:Google "http://metadata.google.internal/computeMetadata/v1/instance/$1" 2>/dev/null || true; }
@@ -42,9 +45,9 @@ SLOTS=()
 for w in "${!IPS[@]}"; do
     if [ "$w" = 0 ]; then n=$(ls /dev/accel* 2>/dev/null | wc -l)
     else
-        rsync -a -e "$SSH" --exclude data/ "$PROBE_DIR/" "${IPS[$w]}:$PROBE_DIR/" || exit 1
         rsync -a -e "$SSH" "$HERE/" "${IPS[$w]}:$HERE/" || exit 1
-        n=$($SSH "${IPS[$w]}" "mkdir -p $PROBE_DIR/data; ls /dev/accel* 2>/dev/null | wc -l")
+        [ "$PROBE_DIR" = "$HERE/client" ] || rsync -a -e "$SSH" --exclude data/ "$PROBE_DIR/" "${IPS[$w]}:$PROBE_DIR/" || exit 1
+        n=$($SSH "${IPS[$w]}" "ls /dev/accel* 2>/dev/null | wc -l")
     fi
     for c in $(seq 0 $((n - 1))); do SLOTS+=("$w $c"); done
 done
@@ -75,13 +78,12 @@ wait
 echo "[$LABEL] all $job jobs done at $(date -u +%T)"
 
 # Merge parts -> per-rep files (same format as the GPU pipeline), then avg@N.
-$PY - "$PROBE_DIR" "$OUT_DIR" "$LABEL" "$N_REPS" "$PARTS" <<'PYEOF'
+$PY - "$PROBE_DIR" "$OUT_DIR" "$LABEL" "$N_REPS" "$PARTS" "$RESULT_DIR" <<'PYEOF'
 import importlib.util, json, os, statistics, sys
-here, out_dir, label, n, parts = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+here, out_dir, label, n, parts, data = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
 sys.path.insert(0, here)
 spec = importlib.util.spec_from_file_location("ev", os.path.join(here, "12_evaluate_checkpoint.py"))
 ev = importlib.util.module_from_spec(spec); spec.loader.exec_module(ev)
-data = os.path.join(here, "data")
 for split in ("unseen", "seen"):
     rates = []
     for rep in range(1, n + 1):

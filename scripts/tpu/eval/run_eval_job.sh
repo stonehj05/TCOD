@@ -3,9 +3,8 @@
 # 12_evaluate_checkpoint.py --full-memory on games [START, END) of SPLIT, then stop the server
 # and free the chip. Called by evaluate_checkpoint_avg4.sh (possibly over ssh).
 #
-# The evaluation client is NOT part of this repo: $PROBE_DIR (default ~/alfworld_ts_probe) must
-# contain 12_evaluate_checkpoint.py and its helpers (run_episode.py, run_episode_tcod.py,
-# model_client.py, tcod_alfworld_utils.py, alfworld_agent_utils.py).
+# The evaluation client is client/ next to this script (12_evaluate_checkpoint.py and its
+# helpers); set $PROBE_DIR to use another copy.
 # Task files: $TASK_DIR/{test,test_unseen,train_hard}.jsonl (default ~/alf-data/tcod_tasks,
 # written by scripts/tpu/setup_node.sh).
 #
@@ -16,7 +15,7 @@ MODEL_PATH=$1 SERVED_NAME=$2 CHIP=$3 REP=$4 SPLIT=$5 START=$6 END=$7 OUT=$8
 WORKERS=${WORKERS:-8} MAX_ENV_STEPS=30 TEMPERATURE=0.4
 # Server sizing: lower these for a model that does not fit one chip's memory at 0.85.
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85} MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
-PROBE_DIR=${PROBE_DIR:-$HOME/alfworld_ts_probe}
+PROBE_DIR=${PROBE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/client}
 TASK_DIR=${TASK_DIR:-$HOME/alf-data/tcod_tasks}
 VENV=${VENV:-$HOME/venv-vllm-tpu}
 cd "$PROBE_DIR" || { echo "ERROR: PROBE_DIR $PROBE_DIR not found"; exit 1; }

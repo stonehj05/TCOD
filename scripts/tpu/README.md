@@ -346,13 +346,22 @@ bash scripts/tpu/eval/evaluate_checkpoint_avg4.sh <run>/global_step_250/actor/hu
 bash scripts/tpu/eval/eval_all_checkpoints.sh <run> my_label_prefix
 ```
 
-- **The evaluation client is not in this repo.** `PROBE_DIR` (default `~/alfworld_ts_probe`)
-  must contain `12_evaluate_checkpoint.py` and its helpers (`run_episode.py`,
-  `run_episode_tcod.py`, `model_client.py`, `tcod_alfworld_utils.py`,
-  `alfworld_agent_utils.py`). Get that directory from the project owner.
+- The evaluation client is `scripts/tpu/eval/client/`: `12_evaluate_checkpoint.py` and its
+  helpers, copied unchanged from the project's GPU evaluation code so that TPU and GPU numbers
+  come from the same client. It talks to any OpenAI-compatible server; the launchers start one
+  vLLM-TPU server per chip for it. Its built-in default data paths point at the original GPU
+  machine and are never used here, because the launchers always pass the task files
+  (`$TASK_DIR`, default `~/alf-data/tcod_tasks`). Set `PROBE_DIR` to use a different copy.
+- Quick check of the client without any TPU (mock model, two games):
+  `cd scripts/tpu/eval/client && python 12_evaluate_checkpoint.py --base-url http://localhost:1/v1
+  --model mock --mock-model --full-memory --split unseen --task-end 2 --workers 2
+  --unseen-jsonl ~/alf-data/tcod_tasks/test_unseen.jsonl --output /tmp/m.jsonl --summary /tmp/m.json`
 - Protocol: `--full-memory`, temperature 0.4, 30 env steps, 4096 max tokens, 4 reps of
   seen (140 games) and unseen (134 games); the result is mean +/- std over reps.
-- Results: `$PROBE_DIR/data/avg4_<label>.log` and `eval_<label>.rep<R>.<split>.*`.
+- Results go to `$RESULT_DIR` (default `checkpoints/eval_results/`, shared across workers and
+  git-ignored): `eval_<label>.rep<R>.<split>.{jsonl,summary.json}`; the final lines printed by
+  the launcher are the avg@N summary (redirect its output to keep them, as
+  `eval_all_checkpoints.sh` does in `avg4_<label>.log` and `avg4_<prefix>_all.log`).
 - The work is split into one job per chip and merged afterwards; with fewer chips than jobs
   it runs in waves. Verified on 16 chips.
 - Do not run it while training holds the chips.
@@ -480,6 +489,6 @@ Operating
 | `scripts/tpu/setup_node.sh`, `requirements-tpu.txt`, `tpu_inference_rpa_v3_tpu_v4.patch` | per-VM environment |
 | `scripts/tpu/start_cluster.sh` | NFS shares, teacher weights, Ray cluster with role labels |
 | `scripts/tpu/checks/` | pre-flight checks (section 6) |
-| `scripts/tpu/eval/` | avg@N evaluation on all chips |
+| `scripts/tpu/eval/` | avg@N evaluation on all chips; `client/` is the evaluation client |
 | `scripts/tpu/tpu_usage.sh`, `rollout_speed.py`, `export_live_state.py` | monitoring and tools |
 | `tests/tpu/`, `tests/workflow/` | loss parity test; gate logic test for the combined workflow |
