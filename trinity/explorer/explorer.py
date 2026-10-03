@@ -330,7 +330,10 @@ class Explorer:
             no_wait=(self.config.synchronizer.sync_style != SyncStyle.FIXED),
         )
         if new_version > self.model_version:
-            if self.model_version != -1:
+            # The first pull normally skips loading (engines start from the base model =
+            # version 0). A resumed vllm_tpu run starts from a trained checkpoint, so load it.
+            resumed = self.model_version == -1 and new_version > 0 and self.model_type == "vllm_tpu"
+            if self.model_version != -1 or resumed:
                 self.logger.info(f"New model weights version: {new_version}")
                 await asyncio.gather(
                     *[model.sync_model.remote(new_version, "student") for model in self.models]

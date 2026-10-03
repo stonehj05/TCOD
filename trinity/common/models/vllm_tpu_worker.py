@@ -66,6 +66,11 @@ class TPUWorkerExtension:
             index[keys] = i
 
         leaves = [v for _, v in flat]
+        # Leaves can share one buffer (e.g. tied embedding / lm_head); a buffer is freed only
+        # once every leaf that referenced it has been replaced.
+        holders = {}
+        for i, v in enumerate(leaves):
+            holders.setdefault(id(v), set()).add(i)
         updated = 0
         files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not files:
@@ -79,6 +84,14 @@ class TPUWorkerExtension:
                     old = leaves[i]
                     new = _to_vllm_layout(name, st.get_tensor(name), old.shape)
                     leaves[i] = jax.device_put(new.astype(old.dtype), old.sharding)
+                    # Free the old buffer now instead of when the whole state is swapped:
+                    # otherwise a reload needs a second full copy of the weights in HBM
+                    # (e.g. +8 GB for a 4B student next to vLLM's KV-cache reservation).
+                    # Safe: collective_rpc runs between engine steps, never during one.
+                    refs = holders.get(id(old), set())
+                    refs.discard(i)
+                    if not refs and not old.is_deleted():
+                        old.delete()
                     updated += 1
         runner.state = jax.tree_util.tree_unflatten(treedef, leaves)
         runner.state_leaves = tuple(jax.tree_util.tree_leaves(runner.state))

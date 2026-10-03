@@ -21,9 +21,29 @@ from trinity.common.models.model import BaseInferenceModel
 from trinity.common.models.vllm_model import vLLMRolloutModel
 
 
+METRICS_BASE_PORT = 8431  # libtpu's default runtime-metrics port (what `tpu-info` reads)
+
+
+def set_tpu_metrics_port() -> None:
+    """Give this process its own libtpu runtime-metrics port: 8431 + its first TPU chip.
+
+    Several engines share a VM (one per chip); by default all of them serve metrics on 8431,
+    so tools like `tpu-info` only reach one. Must run before the TPU backend initializes;
+    vLLM's EngineCore subprocess inherits the environment.
+    """
+    chips = os.environ.get("TPU_VISIBLE_CHIPS", "")  # set by Ray for the actor's chips
+    if not chips or "runtime_metric_service_port" in os.environ.get("LIBTPU_INIT_ARGS", ""):
+        return
+    port = METRICS_BASE_PORT + int(chips.split(",")[0])
+    os.environ["LIBTPU_INIT_ARGS"] = (
+        os.environ.get("LIBTPU_INIT_ARGS", "") + f" --runtime_metric_service_port={port}"
+    ).strip()
+
+
 class vLLMTPURolloutModel(vLLMRolloutModel):
     def __init__(self, config: InferenceModelConfig) -> None:
         BaseInferenceModel.__init__(self, config)  # skip the CUDA-specific engine setup
+        set_tpu_metrics_port()
 
         import vllm
         from vllm.sampling_params import RequestOutputKind

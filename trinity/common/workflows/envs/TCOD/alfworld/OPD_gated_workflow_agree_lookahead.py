@@ -1,0 +1,490 @@
+# -*- coding: utf-8 -*-
+"""Gated OPD workflow for AlfWorld -- AGREEMENT + LOOK-AHEAD, combined soft weighting.
+
+Combines the two teacher gates used separately elsewhere:
+
+  (A) agreement  (OPD_gated_workflow_fullmemory.py): "would you choose this exact action
+      for the current step?"  The criterion is met when the teacher says NO (or the
+      answer is unparseable) -- the teacher disagrees with the student's action.
+  (B) look-ahead (OPD_gated_workflow_lookahead_soft.py): "do the next `window_size` steps
+      make progress toward the task?"  The criterion is met when the teacher says NO (or
+      unparseable) -- the student is NOT making progress.
+
+Per step, the OPD correction weight is
+
+    weight = single_criterion_weight * [A met] + single_criterion_weight * [B met]
+
+i.e. with the default single_criterion_weight = 0.5:  both met -> 1.0 (full OPD), exactly
+one met -> 0.5 (downweighted OPD), neither met -> 0.0 (no OPD on that step).
+
+All teacher prompts of an episode -- both questions for every step, and afterwards the
+logprob-scoring calls -- are issued concurrently, at most `teacher_parallel_prompts` at a
+time, so the teacher's vLLM engine batches them (continuous batching) instead of serving
+one prompt after another. They are asked after the rollout has finished, because (B) needs
+the steps that follow; (A) only uses the conversation up to that step, exactly as in the
+agreement-gated workflow, so asking it later does not change what the teacher sees. The
+answers do not depend on each other, so the order of completion does not matter.
+
+For the trajectory's final `window_size` steps no forward window exists. As in the
+look-ahead variants, (B) falls back to the ground-truth outcome there: "not making
+progress" iff the episode failed. (A) is still asked for those steps.
+
+The weight is applied the same way as in OPD_gated_workflow_lookahead_soft.py (see that
+file's module docstring for why): the stored teacher logprobs are blended toward the
+student's own, `student + weight * (teacher - student)`, which scales the advantage by
+exactly `weight` through the unmodified shared advantage function. weight = 0 therefore
+gives zero advantage on that step. Per-turn `kl_divergence` metrics use the raw teacher
+logprobs.
+"""
+
+import asyncio
+import string
+from dataclasses import asdict
+from typing import Dict, List, Optional
+
+import torch
+
+from trinity.common.experience import Experience
+from trinity.common.models.model import ModelWrapper
+from trinity.common.workflows import WORKFLOWS, Task, Workflow
+
+from trinity.common.workflows.envs.TCOD.alfworld.utils import (
+    ALFWORLD_TEMPLATE_NO_HIS,
+    ALFWORLD_TEMPLATE,
+    HISTORY_LENGTH,
+    parse_action,
+    format_observation,
+    _extract_task,
+    _format_history,
+    _create_alfworld_env,
+)
+
+DEFAULT_WINDOW_SIZE = 5
+DEFAULT_SINGLE_CRITERION_WEIGHT = 0.5
+DEFAULT_TEACHER_PARALLEL_PROMPTS = 16
+
+# Same wording as OPD_gated_workflow_fullmemory.py's agreement check.
+YES_NO_ADDENDUM = """
+
+Now suppose the action chosen for the current step is:
+{student_action}
+
+Would you choose this exact action for the current step? First briefly reason \
+about whether it is the best available action, then give your final decision \
+wrapped in <answer></answer> tags -- either <answer>Yes</answer> or \
+<answer>No</answer>. Do not output any other text besides your reasoning and \
+the final answer."""
+
+# Same wording as OPD_gated_workflow_lookahead_soft.py's progress check.
+
+PROGRESS_ADDENDUM = """Based on the {window_len} step(s) shown above (steps \
+{start_step}-{end_step}), do you think the agent is making progress toward \
+completing the task? First briefly reason about whether those particular \
+steps help advance the goal, then give your final decision wrapped in \
+<answer></answer> tags -- either <answer>Yes</answer> or <answer>No</answer>. \
+Do not output any other text besides your reasoning and the final answer."""
+
+
+def parse_yes_no(response: str) -> Optional[bool]:
+    """Same convention as every other gated variant's parse_yes_no: looks at
+    the first word inside <answer></answer> (or of the whole response if no
+    tag is present). Returns None if unparseable."""
+    try:
+        content = (
+            response.rsplit("<answer>", 1)[-1].split("</answer>")[0]
+            if "<answer>" in response
+            else response
+        )
+        words = content.strip().lower().split()
+        if not words:
+            return None
+        first = words[0].strip(string.punctuation)
+        if first == "yes":
+            return True
+        if first == "no":
+            return False
+        return None
+    except Exception:
+        return None
+
+
+@WORKFLOWS.register_module("OPD_gated_alfworld_workflow_agree_lookahead")
+class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
+    """Agreement + look-ahead gated on-policy distillation workflow for AlfWorld.
+
+    Per step: weight 1.0 if the teacher both disagrees with the student's action and
+    judges the following steps as not making progress, 0.5 if exactly one of the two
+    holds, 0.0 if neither. See the module docstring.
+    """
+
+    is_async: bool = True
+    can_reset: bool = True
+    can_repeat: bool = False
+
+    def __init__(
+        self,
+        *,
+        task: Task,
+        model: ModelWrapper,
+        auxiliary_models: Optional[List[ModelWrapper]] = None,
+    ):
+        super().__init__(
+            task=task,
+            model=model,
+            auxiliary_models=auxiliary_models,
+        )
+        self.reset(task)
+
+        assert (
+            self.auxiliary_model_wrappers is not None
+            and len(self.auxiliary_model_wrappers) >= 1
+        ), "On-policy distillation requires at least one auxiliary model as teacher."
+        self.teacher_model = self.auxiliary_model_wrappers[0]
+
+        self.temperature = task.workflow_args.get("temperature", 1.0)
+        self.max_env_steps = task.workflow_args.get("max_env_steps", 30)
+        self.is_eval = task.is_eval
+
+        self.window_size = task.workflow_args.get("progress_window_size", DEFAULT_WINDOW_SIZE)
+        self.progress_temperature = task.workflow_args.get("progress_temperature", 0.0)
+        self.progress_max_tokens = task.workflow_args.get("progress_max_tokens", 512)
+        self.consistency_temperature = task.workflow_args.get("consistency_temperature", 0.0)
+        self.consistency_max_tokens = task.workflow_args.get("consistency_max_tokens", 512)
+        self.single_criterion_weight = task.workflow_args.get(
+            "single_criterion_weight", DEFAULT_SINGLE_CRITERION_WEIGHT
+        )
+        # Max teacher requests in flight per episode (1 = strictly sequential).
+        self.teacher_parallel_prompts = max(
+            1, int(task.workflow_args.get("teacher_parallel_prompts", DEFAULT_TEACHER_PARALLEL_PROMPTS))
+        )
+
+    def reset(self, task: Task):
+        """Reset the workflow with a new task.
+
+        Unlike BaseSimpleWorkflow, this does NOT require reward_fn.
+        """
+        self.task = task
+        self.format_args = task.format_args
+        self.raw_task = task.raw_task
+        self.task_desc = task.task_desc or "0"
+        self.is_eval = task.is_eval
+
+    def set_repeat_times(self, repeat_times, run_id_base):
+        self.repeat_times = repeat_times
+        self.task.rollout_args.n = repeat_times
+        self.run_id_base = run_id_base
+
+    def compute_reward(self, response: Experience) -> float:
+        """Return episode-level reward (same for all turns in the trajectory).
+
+        Set in _run_episode: env reward when done, 0.0 when max steps exhausted.
+        """
+        return getattr(self, "_final_reward", 0.0)
+
+    @property
+    def rollout_args(self):
+        return asdict(self.task.rollout_args)
+
+    async def run_async(self) -> List[Experience]:
+        game_file_path = self.task_desc
+        env = _create_alfworld_env(game_file_path)
+        try:
+            return await self._run_episode(env)
+        finally:
+            env.close()
+
+    async def _ask_teacher_agree(
+        self, memory: List[Dict[str, str]], step: int, action: str
+    ) -> tuple:
+        """Ask the teacher whether it would choose `action` at step `step` (0-indexed).
+        Same prompt construction as OPD_gated_workflow_fullmemory.py: the conversation up
+        to and including that step's user message, with the yes/no addendum appended to it
+        (the student's own response for that step is not shown).
+        """
+        context = memory[: 2 * step + 1]
+        yes_no_messages = context[:-1] + [
+            {
+                "role": "user",
+                "content": context[-1]["content"] + YES_NO_ADDENDUM.format(student_action=action),
+            }
+        ]
+        yn_responses = await self.teacher_model.chat_async(
+            yes_no_messages,
+            temperature=self.consistency_temperature,
+            max_tokens=self.consistency_max_tokens,
+            n=1,
+        )
+        response_text = yn_responses[0].response_text or ""
+        return parse_yes_no(response_text), response_text
+
+    async def _ask_teacher_progress(
+        self, memory: List[Dict[str, str]], window_start: int, window_end: int
+    ) -> tuple:
+        """Ask the teacher whether steps [window_start, window_end] (both
+        0-indexed, inclusive) show genuine progress toward the task goal.
+        Identical to OPD_gated_workflow_lookahead_soft.py's version.
+        """
+        context = memory[: 2 * (window_end + 1)]
+        progress_messages = context + [
+            {
+                "role": "user",
+                "content": PROGRESS_ADDENDUM.format(
+                    window_len=window_end - window_start + 1,
+                    start_step=window_start + 1,
+                    end_step=window_end + 1,
+                ),
+            }
+        ]
+        pr_responses = await self.teacher_model.chat_async(
+            progress_messages,
+            temperature=self.progress_temperature,
+            max_tokens=self.progress_max_tokens,
+            n=1,
+        )
+        response_text = pr_responses[0].response_text or ""
+        return parse_yes_no(response_text), response_text
+
+    async def _run_episode(self, env) -> List[Experience]:
+        observation, info = env.reset()
+        self._env_done = False
+        self._env_rounds = 0
+
+        task_description = _extract_task(observation)
+        history: List[str] = []
+        turn_responses: List[Experience] = []
+        actions: List[str] = []
+        memory: List[Dict[str, str]] = []
+
+        kwargs = {**self.rollout_args, "n": 1}
+        if kwargs.get("logprobs") is None:
+            kwargs["logprobs"] = 0
+
+        # ---- Pass 1: run the full rollout. No gating decisions here -- the
+        # look-ahead gate needs future steps that don't exist yet. ----
+        for r in range(self.max_env_steps):
+            format_obs = format_observation(observation)
+            admissible_commands = info.get("admissible_commands", [])
+            if admissible_commands and isinstance(admissible_commands[0], list):
+                admissible_commands = admissible_commands[0]
+            reformatted_admissible = "\n ".join(
+                f"'{s}'" for s in admissible_commands if s != "help"
+            )
+
+            if len(history) < HISTORY_LENGTH:
+                user_content = ALFWORLD_TEMPLATE_NO_HIS.format(
+                    current_observation=format_obs,
+                    admissible_actions=reformatted_admissible,
+                )
+            else:
+                action_history_str = "\n".join(
+                    history[-HISTORY_LENGTH:]
+                    if len(history) >= HISTORY_LENGTH
+                    else history
+                )
+                user_content = ALFWORLD_TEMPLATE.format(
+                    task_description=task_description,
+                    step_count=r,
+                    history_length=min(HISTORY_LENGTH, len(history)),
+                    action_history=action_history_str,
+                    current_step=r + 1,
+                    current_observation=format_obs,
+                    admissible_actions=reformatted_admissible,
+                )
+
+            memory = memory + [{"role": "user", "content": user_content}]
+
+            responses = await self.model.chat_async(memory, **kwargs)
+            response = responses[0]
+            response_text = response.response_text or ""
+            memory = memory + [{"role": "assistant", "content": response_text}]
+
+            if response.logprobs is None:
+                raise RuntimeError(
+                    "OPDGatedAlfworldWorkflowAgreeLookahead requires student model to return "
+                    "logprobs. Set rollout_args.logprobs (e.g. 0) in task config."
+                )
+
+            action = parse_action(response_text)
+            turn_responses.append(response)
+            actions.append(action)
+
+            history.append(_format_history(format_obs, r + 1, action))
+            observation, reward, done, info = env.step(action)
+            if done:
+                self._env_done = True
+                self._env_rounds = r + 1
+                self._final_reward = 1.0
+                break
+        else:
+            self._env_rounds = self.max_env_steps
+            self._final_reward = 0.0  # failure: exhausted max steps
+
+        n_total_steps = len(turn_responses)
+
+        # ---- Pass 2: ask the teacher both questions for every step, batched (bounded
+        # concurrency), then turn the two criteria into a correction weight per step. ----
+        n_agree_unparseable = 0
+        n_windowed_calls = 0
+        n_windowed_unparseable = 0
+        agree_response_lengths: List[int] = []
+        windowed_response_lengths: List[int] = []
+        gate_weights: List[float] = []
+        n_disagree = 0
+        n_not_progress = 0
+
+        limiter = asyncio.Semaphore(self.teacher_parallel_prompts)
+
+        async def limited(coro):
+            async with limiter:
+                return await coro
+
+        has_window = [t + self.window_size < n_total_steps for t in range(n_total_steps)]
+        agree_answers, progress_answers = await asyncio.gather(
+            asyncio.gather(
+                *[limited(self._ask_teacher_agree(memory, t, actions[t])) for t in range(n_total_steps)]
+            ),
+            asyncio.gather(
+                *[
+                    limited(self._ask_teacher_progress(memory, t, t + self.window_size - 1))
+                    for t in range(n_total_steps)
+                    if has_window[t]
+                ]
+            ),
+        )
+        progress_iter = iter(progress_answers)
+
+        for t in range(n_total_steps):
+            teacher_agrees, agree_text = agree_answers[t]
+            if has_window[t]:
+                teacher_says_progress, progress_text = next(progress_iter)
+                n_windowed_calls += 1
+                if teacher_says_progress is None:
+                    n_windowed_unparseable += 1
+                windowed_response_lengths.append(len(progress_text))
+                # Criterion B: not making progress ("No" or unparseable -- fail-safe).
+                not_progress = teacher_says_progress is not True
+            else:
+                # Last window_size steps: no forward window; use the ground-truth outcome
+                # (failed episode = not making progress), as in the look-ahead variants.
+                not_progress = not bool(self._final_reward)
+
+            if teacher_agrees is None:
+                n_agree_unparseable += 1
+            agree_response_lengths.append(len(agree_text))
+            # Criterion A: teacher disagrees with the action ("No" or unparseable -- fail-safe).
+            disagree = teacher_agrees is not True
+
+            weight = self.single_criterion_weight * (int(disagree) + int(not_progress))
+            n_disagree += int(disagree)
+            n_not_progress += int(not_progress)
+
+            response = turn_responses[t]
+            response.opd_gate_weight = weight  # consumed in the logprobs loop below
+            if response.metrics is None:
+                response.metrics = {}
+            response.metrics["opd_gate_disagree"] = float(disagree)
+            response.metrics["opd_gate_not_progress"] = float(not_progress)
+            gate_weights.append(weight)
+
+        # ---- Pass 3: teacher logprobs, blend by weight, fill experience. ----
+        per_turn_kl_sums: List[float] = []
+        all_teacher_logprobs = await asyncio.gather(
+            *[
+                limited(
+                    self.teacher_model.logprobs_async(
+                        tokens=response.tokens.tolist(),  # full input = prefix + student's response
+                        temperature=self.temperature,
+                    )
+                )
+                for response in turn_responses
+            ]
+        )
+        for i, response in enumerate(turn_responses):
+            teacher_logprobs = all_teacher_logprobs[i]
+
+            resp_start = response.prompt_length - 1
+            teacher_resp_logprobs = teacher_logprobs[resp_start:]
+            student_resp_logprobs = response.logprobs
+
+            assert len(teacher_resp_logprobs) == len(student_resp_logprobs), (
+                f"Length mismatch: teacher_logprobs={len(teacher_resp_logprobs)}, "
+                f"student_logprobs={len(student_resp_logprobs)}. "
+                f"tokens={len(response.tokens)}, prompt_length={response.prompt_length}"
+            )
+
+            # Raw (unblended) KL for honest diagnostic reporting -- computed
+            # BEFORE blending, so this metric reflects actual student/teacher
+            # divergence regardless of what correction strength was applied.
+            kl_sum = (student_resp_logprobs - teacher_resp_logprobs).sum().item()
+            per_turn_kl_sums.append(kl_sum)
+
+            # Blend the stored teacher logprob toward the student's own by
+            # this position's weight -- see module docstring for why this
+            # scales the resulting advantage by exactly `weight` through the
+            # UNMODIFIED shared advantage function, with no mask needed.
+            weight = getattr(response, "opd_gate_weight", 1.0)
+            blended_teacher_logprobs = student_resp_logprobs + weight * (
+                teacher_resp_logprobs - student_resp_logprobs
+            )
+            response.teacher_logprobs = blended_teacher_logprobs
+            response.teacher_logprobs_valid_mask = torch.full(
+                (len(teacher_resp_logprobs),), True, dtype=torch.bool
+            )
+
+            if response.metrics is None:
+                response.metrics = {}
+            response.reward = self.compute_reward(response)
+            response.eid.run = getattr(self, "run_id_base", 0)
+            response.eid.step = i
+            response.metrics["opd_gate_weight"] = weight
+
+        # Trajectory-level metrics (computed once for the whole trajectory)
+        trajectory_kl_divergence = sum(per_turn_kl_sums)
+        if turn_responses:
+            last_response = turn_responses[-1]
+            if last_response.metrics is None:
+                last_response.metrics = {}
+            last_response.metrics["env_rounds"] = self._env_rounds
+            last_response.metrics["env_done"] = 1.0 if self._env_done else 0.0
+            last_response.metrics["kl_divergence"] = trajectory_kl_divergence
+            # Mean correction weight across all steps (same metric name as the other
+            # gated variants, for direct comparability).
+            last_response.metrics["opd_gate_apply_rate"] = (
+                sum(gate_weights) / len(gate_weights) if gate_weights else 0.0
+            )
+            if n_total_steps:
+                both = self.single_criterion_weight * 2
+                last_response.metrics["opd_gate_full_rate"] = (
+                    sum(w == both for w in gate_weights) / n_total_steps
+                )
+                last_response.metrics["opd_gate_half_rate"] = (
+                    sum(w == self.single_criterion_weight for w in gate_weights) / n_total_steps
+                )
+                last_response.metrics["opd_gate_none_rate"] = (
+                    sum(w == 0.0 for w in gate_weights) / n_total_steps
+                )
+                last_response.metrics["opd_gate_disagree_rate"] = n_disagree / n_total_steps
+                last_response.metrics["opd_gate_not_progress_rate"] = n_not_progress / n_total_steps
+                last_response.metrics["consistency_parse_success_rate"] = (
+                    1.0 - n_agree_unparseable / n_total_steps
+                )
+                last_response.metrics["consistency_response_length_mean"] = sum(
+                    agree_response_lengths
+                ) / len(agree_response_lengths)
+                last_response.metrics["consistency_response_length_max"] = max(agree_response_lengths)
+            last_response.metrics["n_windowed_gate_decisions"] = n_windowed_calls
+            last_response.metrics["n_outcome_gate_decisions"] = (
+                n_total_steps - n_windowed_calls
+            )
+            if n_windowed_calls:
+                last_response.metrics["progress_parse_success_rate"] = (
+                    1.0 - n_windowed_unparseable / n_windowed_calls
+                )
+                last_response.metrics["progress_response_length_mean"] = sum(
+                    windowed_response_lengths
+                ) / len(windowed_response_lengths)
+                last_response.metrics["progress_response_length_max"] = max(
+                    windowed_response_lengths
+                )
+
+        return turn_responses

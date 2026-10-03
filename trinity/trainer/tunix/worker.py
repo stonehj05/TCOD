@@ -209,6 +209,17 @@ class TunixActorWorker:
             model = nnx.merge(self.graphdef, self.params, self.rest)
             return hf_io.save_hf_checkpoint(model, self.model_dir, output_dir)
 
+    def export_state(self, out_dir: str) -> Dict:
+        """Exact training state (fp32 params, optimizer, step) for resuming; see tunix/resume.py."""
+        from trinity.trainer.tunix import resume
+
+        return resume.export_state(self, out_dir, self.step)
+
+    def load_state(self, in_dir: str) -> int:
+        from trinity.trainer.tunix import resume
+
+        return resume.load_state(self, in_dir)
+
     def ready(self) -> bool:
         return True
 

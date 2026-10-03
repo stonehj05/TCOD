@@ -79,11 +79,24 @@ class Synchronizer:
                         alive_modules.add(module)
                 self._modules = alive_modules
             await asyncio.sleep(1)
+        self._remove_sync_checkpoints()
         self.logger.info("Synchronizer stopped.")
         try:
             ray.actor.exit_actor()
         except Exception:
             pass
+
+    def _remove_sync_checkpoints(self) -> None:
+        """tunix trainer with trainer.sync_checkpoint_dir: drop this run's weight-sync
+        checkpoints (tmpfs) once explorer and trainer are gone. Full checkpoints live in
+        checkpoint_job_dir and are kept."""
+        if self.config.trainer.trainer_type != "tunix" or not self.config.trainer.sync_checkpoint_dir:
+            return
+        from trinity.trainer.tunix_trainer import sync_checkpoint_root
+
+        root = sync_checkpoint_root(self.config)
+        shutil.rmtree(root, ignore_errors=True)
+        self.logger.info(f"Removed weight-sync checkpoints in {root}.")
 
     async def _find_latest_state_dict(self) -> None:
         if self.config.trainer.trainer_type == "verl":

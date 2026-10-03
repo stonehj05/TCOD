@@ -188,24 +188,30 @@ def _create_tpu_inference_models(
     """
     import ray
 
+    from trinity.common.models.tpu_env import whole_host_runtime_env
     from trinity.common.models.vllm_tpu_model import vLLMTPURolloutModel
 
     namespace = config.ray_namespace
-    # Multi-host: if some nodes were started with `--resources '{"explorer_tpu": N}'`,
-    # keep engines on those nodes so the trainer's host keeps its chips free.
-    pin = "explorer_tpu" in ray.cluster_resources()
+    # Multi-host placement by node label (scripts/tpu/start_cluster.sh): rollout engines go
+    # to nodes started with `--resources '{"explorer_tpu": N}'`, teacher (auxiliary) engines
+    # to `teacher_tpu` nodes if any exist (else also `explorer_tpu`), so the trainer's host
+    # keeps its chips and a multi-chip teacher always finds a whole free host.
+    cluster = ray.cluster_resources()
+    rollout_label = "explorer_tpu" if "explorer_tpu" in cluster else None
+    teacher_label = "teacher_tpu" if "teacher_tpu" in cluster else rollout_label
 
-    def launch(model_config, name):
+    def launch(model_config, name, label):
         model_config.ray_namespace = namespace
         resources = {"TPU": model_config.tensor_parallel_size}
-        if pin:
-            resources["explorer_tpu"] = model_config.tensor_parallel_size
+        if label:
+            resources[label] = model_config.tensor_parallel_size
         return (
             ray.remote(vLLMTPURolloutModel)
             .options(
                 name=name,
                 num_cpus=0,
                 resources=resources,
+                runtime_env=whole_host_runtime_env(model_config.tensor_parallel_size),
                 namespace=namespace,
             )
             .remote(config=model_config)
@@ -213,7 +219,7 @@ def _create_tpu_inference_models(
 
     rollout_config = config.explorer.rollout_model
     rollout_engines = [
-        launch(rollout_config, f"{config.explorer.name}_rollout_model_{i}")
+        launch(rollout_config, f"{config.explorer.name}_rollout_model_{i}", rollout_label)
         for i in range(rollout_config.engine_num)
     ]
     auxiliary_engines = []
@@ -221,7 +227,7 @@ def _create_tpu_inference_models(
         model_config.engine_type = "vllm_tpu"
         auxiliary_engines.append(
             [
-                launch(model_config, f"{config.explorer.name}_auxiliary_model_{i}_{j}")
+                launch(model_config, f"{config.explorer.name}_auxiliary_model_{i}_{j}", teacher_label)
                 for j in range(model_config.engine_num)
             ]
         )

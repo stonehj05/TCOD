@@ -1,0 +1,125 @@
+# Gated OPD, AGREEMENT + LOOK-AHEAD combined (OPD_gated_alfworld_workflow_agree_lookahead).
+# Per step the teacher is asked two questions together:
+#   (A) would you choose the student's action?            -> criterion met if "No"
+#   (B) do the next `progress_window_size` steps progress? -> criterion met if "No"
+# OPD weight = single_criterion_weight * (A met) + single_criterion_weight * (B met):
+# both -> 1.0, exactly one -> 0.5, neither -> 0 (no OPD on that step). Unparseable answers
+# count as "No" (fail-safe). The final window uses the episode outcome for (B).
+# Everything else is identical to opd_gated_lookahead_soft.yaml.
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_agree_lookahead"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: false
+
+# Mechanism: trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_agree_lookahead.py
+# Same plain Qwen3-4B student / plain Qwen3-30B-A3B teacher / full-memory setup as the other
+# gated variants.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_lookahead.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 1
+  gpu_per_node: 8
+
+buffer:
+  total_steps: 250
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /data/hs2352/LookAheadOPD/TCOD/TCOD_examples/alfworld/alfworld_data/train.jsonl
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the windowed progress-judgment call -- same as
+        # opd_gated_lookahead.yaml (reasoning-before-answer prompt).
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        progress_window_size: 5
+        # Decoding for the agreement (yes/no) check -- same as opd_gated_fullmemory.yaml.
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+        # Weight contributed by each met criterion (both met -> 2x = full OPD).
+        single_criterion_weight: 0.5
+        # Teacher requests (both questions for all steps, then the scoring calls) sent
+        # concurrently per episode, so vLLM batches them; 1 = one prompt at a time.
+        teacher_parallel_prompts: 16
+    default_workflow_type: 'OPD_gated_alfworld_workflow_agree_lookahead'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_agree_lookahead_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_agree_lookahead_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_num: 2
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_lookahead.yaml. Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory).
+    - model_path: Qwen/Qwen3-30B-A3B
+      engine_num: 1
+      tensor_parallel_size: 4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'nccl'
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  total_steps: 250
+  save_interval: 25
+  grad_clip: 1.0
+  use_dynamic_bsz: true
+  max_token_len_per_gpu: 16384
+  ulysses_sequence_parallel_size: 2
+
+monitor:
+  monitor_type: wandb

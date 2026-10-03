@@ -11,6 +11,7 @@ path and the vLLM-TPU engines load it (vllm_tpu_worker.py).
 """
 
 import os
+import shutil
 from collections import defaultdict
 from typing import Dict, List
 
@@ -19,6 +20,8 @@ import ray
 
 from trinity.common.config import Config
 from trinity.common.experience import Experience
+from trinity.common.models.tpu_env import whole_host_runtime_env
+from trinity.trainer.tunix import resume
 from trinity.trainer.trainer import TrainEngineWrapper
 from trinity.utils.log import get_logger
 
@@ -96,21 +99,21 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         tok = AutoTokenizer.from_pretrained(resolve_model_dir(self.config.model.model_path))
         self.worker_cfg["pad_token_id"] = tok.pad_token_id
         self.worker_cfg["eos_token_id"] = tok.convert_tokens_to_ids("<|im_end|>")
+        resume_step = None
         if self.config.continue_from_checkpoint and os.path.exists(self.local_latest_checkpointed_iteration):
-            raise NotImplementedError("resuming a tunix run from a checkpoint is not implemented yet")
+            with open(self.local_latest_checkpointed_iteration) as f:
+                resume_step = int(f.read().strip())
+            state_dir = resume.resume_state_dir(sync_checkpoint_root(self.config), resume_step)
+            if not os.path.exists(os.path.join(state_dir, "meta.json")):
+                raise FileNotFoundError(
+                    f"no exact training state for step {resume_step} at {state_dir}; the HF checkpoint "
+                    "alone (bf16 weights, no optimizer state) cannot resume the run faithfully")
         os.makedirs(self.default_local_dir, exist_ok=True)
         n_chips = self.config.cluster.trainer_gpu_num
         resources = {"TPU": n_chips}
         if "trainer_tpu" in ray.cluster_resources():  # multi-host: see _create_tpu_inference_models
             resources["trainer_tpu"] = n_chips
-        runtime_env = {}
-        if n_chips == 4:
-            # A whole v4 host: Ray sets no per-host bounds, so libtpu would wait for every
-            # host of the slice to join. Declare a single-process 2x2x1 slice instead.
-            runtime_env = {"env_vars": {
-                "TPU_CHIPS_PER_PROCESS_BOUNDS": "2,2,1", "TPU_PROCESS_BOUNDS": "1,1,1",
-                "TPU_VISIBLE_CHIPS": "0,1,2,3", "TPU_PROCESS_PORT": "8476",
-                "TPU_PROCESS_ADDRESSES": "localhost:8476"}}
+        runtime_env = whole_host_runtime_env(n_chips)
         self.worker = (
             ray.remote(TunixActorWorker)
             .options(num_cpus=1, resources=resources, runtime_env=runtime_env,
@@ -118,6 +121,16 @@ class TunixTrainerWrapper(TrainEngineWrapper):
             .remote(self.worker_cfg)
         )
         await self.worker.ready.remote()
+        if resume_step is not None:
+            step = await self.worker.load_state.remote(state_dir)
+            assert step == resume_step, (step, resume_step)
+            self._train_step_num = self._last_checkpoint_step = step
+            # Publish the resumed weights for the explorer (sync checkpoints may be gone).
+            await self.worker.save_hf.remote(sync_checkpoint_dir(self.config, step))
+            self._last_state_dict_step = step
+            with open(self.local_latest_state_dict_iteration, "w") as f:
+                f.write(str(step))
+            self.logger.info(f"Resumed exact training state at step {step} from {state_dir}.")
 
     @property
     def train_step_num(self) -> int:
@@ -179,6 +192,15 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         os.makedirs(step_dir, exist_ok=True)
         with open(os.path.join(step_dir, ".full_checkpoint"), "w") as f:
             f.write("")
+        # Exact state for resuming (latest full checkpoint only: ~12 B/param on tmpfs).
+        root = sync_checkpoint_root(self.config)
+        state_dir = resume.resume_state_dir(root, self.train_step_num)
+        if not os.path.exists(state_dir):
+            ray.get(self.worker.export_state.remote(state_dir))
+        parent = os.path.dirname(state_dir)
+        for d in os.listdir(parent):
+            if d.startswith("global_step_") and os.path.join(parent, d) != state_dir:
+                shutil.rmtree(os.path.join(parent, d), ignore_errors=True)
         with open(self.local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.train_step_num))
         self._last_checkpoint_step = self.train_step_num

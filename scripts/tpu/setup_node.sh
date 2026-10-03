@@ -4,13 +4,16 @@
 # after the repo is on each worker). Idempotent: safe to re-run.
 #
 # Produces: ~/venv-vllm-tpu (exact pinned env, see requirements-tpu.txt), the TPU v4 kernel
-# patch applied, ALFWorld data in ~/alf-data with remapped TCOD task files, and the HF models.
+# patch applied, ALFWorld data in ~/alf-data with remapped TCOD task files, and the HF models
+# ($MODELS, default the 4B student; e.g. MODELS="Qwen/Qwen3-1.7B Qwen/Qwen3-8B" for the small pair).
 set -euo pipefail
 
 REPO=${REPO:-$HOME/TCOD}
 VENV=${VENV:-$HOME/venv-vllm-tpu}
 ALF=${ALF:-$HOME/alf-data}
-MODELS=${MODELS:-"Qwen/Qwen3-1.7B Qwen/Qwen3-8B"}
+# Models for the Hugging Face cache on this VM (student + single-chip teachers). A large
+# multi-chip teacher is better kept on tmpfs: see TEACHER_MODEL in start_cluster.sh.
+MODELS=${MODELS:-"Qwen/Qwen3-4B"}
 HERE=$REPO/scripts/tpu
 
 # 1. uv + Python 3.12.14 + venv

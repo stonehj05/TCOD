@@ -328,6 +328,14 @@ And logging/monitor settings are controlled by:
 
 ---
 
+## Running on Cloud TPU
+
+The `tpu-port` branch adds TPU backends (vLLM-TPU engines, a JAX/Tunix trainer) next to the GPU
+ones. Setup, layout planning for different TPU configurations, pre-flight checks, evaluation
+and known issues are documented in [`scripts/tpu/README.md`](scripts/tpu/README.md).
+
+---
+
 ## Citation
 
 ```bibtex
