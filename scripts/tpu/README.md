@@ -396,7 +396,7 @@ cluster:
   node_num: 4                            # see 5.2: these two set the trainer's chip count
   gpu_per_node: 4
 buffer:
-  total_steps: 300                       # explorer steps; keep above trainer.total_steps
+  total_steps: 300                       # explorer steps; keep above trainer.total_steps (far above with defer_teacher, 10.1)
   explorer_input:
     taskset:
       path: /home/<user>/alf-data/tcod_tasks/train.jsonl
@@ -427,6 +427,59 @@ The tunix trainer supports `algorithm_type: on_policy_distill` with a constant l
 and reads `algorithm.optimizer` (lr, betas, weight_decay), `algorithm.advantage_fn_args.kl_coef`,
 `algorithm.policy_loss_fn_args` and `trainer.grad_clip`. verl-only keys (`use_dynamic_bsz`,
 `ulysses_sequence_parallel_size`, ...) are not used.
+
+### 10.1 Teacher work in the trainer (`defer_teacher`)
+
+By default the explorer does all teacher work for every turn it generates: logprob scoring,
+and for the gated workflows the agreement and progress prompts. An explore step of 16 games
+yields roughly 350-850 turns, but the trainer takes only `train_batch_size` (64) of them per
+step in arrival order and drops the rest once they are more than `max_staleness` versions
+old, so most of that teacher work is never used and the trainer sits idle waiting for it.
+
+With `defer_teacher: true` the explorer only plays the games, and the trainer asks the
+teacher for the turns of each training batch:
+
+```yaml
+buffer:
+  total_steps: 3000                      # upper bound only, see below
+  explorer_input:
+    taskset:
+      workflow_args:
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+        skip_zero_weight_scoring: false        # gated workflows only, see below
+```
+
+- **Supported workflows:** `OPD_gated_alfworld_workflow_agree_lookahead` (both gate modes) and
+  vanilla `OPD_alfworld_workflow_fullmemory` (scoring only). Ready configs:
+  `opd_gated_disagree_lookahead_deferred_tpu.yaml`, `opd_fullmemory_deferred_tpu.yaml`.
+  Only with `trainer_type: tunix`.
+- **How it works:** each turn carries the gate's inputs in `info["opd_deferred"]` (its action,
+  the episode outcome, and the conversation through the end of its look-ahead window,
+  zlib-compressed). `trinity/trainer/tunix/teacher_gate.py` builds the prompts with the
+  workflow module's own functions, so a turn gets the same prompts, weight and stored
+  `teacher_logprobs` as with the explorer-side gate
+  (`tests/workflow/test_opd_gated_agree_lookahead.py` checks this).
+- **Teacher engines:** still declared in `explorer.auxiliary_models` and placed as before;
+  the trainer reaches them by Ray actor name (`explorer_auxiliary_model_0_<j>`). The chip
+  layout does not change.
+- **Explorer steps:** the explorer no longer waits for the teacher, runs ahead of the
+  trainer and keeps generating games with the newest weights. `buffer.total_steps` must be
+  large enough that it never finishes first (the teachers shut down with it); the run ends
+  when the trainer reaches `trainer.total_steps`.
+- **Metrics:** per training step in `trainer.log` / tensorboard: `time/teacher_gate`
+  (`_prompts`, `_scoring`), `teacher_gate/opd_gate_{full,half,none,disagree}_rate`, parse
+  rates, `teacher_gate/raw_kl_per_turn`. The explorer no longer logs gate metrics.
+- **`skip_zero_weight_scoring`:** does not score turns whose gate weight is 0. Their stored
+  teacher logprobs equal the student's own either way, so training is unchanged; only the
+  raw-KL diagnostic covers fewer turns. Its time saving has not been measured.
+- **What changes in training:** nothing in the gate or loss. The trainer no longer starves,
+  so every batch is exactly `max_staleness` versions old instead of a mix of 1-2.
+
+Measured on v4-32 (4B student, two 30B-A3B teachers, disagree-required gate, 12-step test):
+explore step about 77 s instead of about 450 s; a training step end to end about 127 s
+instead of about 8 min (teacher gating + scoring 22-59 s of it); 250 steps extrapolate to
+about 9 h instead of 33.6 h. Other chip layouts were not tried.
 
 ## 11. Known issues and gotchas
 
@@ -483,6 +536,7 @@ Operating
 | `trinity/trainer/tunix/logps.py` | completion log-probs and the OPD/PPO loss |
 | `trinity/trainer/tunix/hf_io.py` | HF checkpoint load / export |
 | `trinity/trainer/tunix/resume.py` | exact-state save / restore |
+| `trinity/trainer/tunix/teacher_gate.py` | `defer_teacher`: teacher gating and scoring of the sampled turns in the trainer (10.1) |
 | `trinity/manager/synchronizer.py` | publishes sync checkpoints (`_find_tunix_latest_state_dict`), cleanup |
 | `trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_agree_lookahead.py` | combined agreement + look-ahead gate with batched teacher calls |
 | `TCOD_examples/alfworld/*_tpu*.yaml` | TPU configs |
