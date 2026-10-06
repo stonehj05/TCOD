@@ -10,12 +10,20 @@ Combines the two teacher gates used separately elsewhere:
       make progress toward the task?"  The criterion is met when the teacher says NO (or
       unparseable) -- the student is NOT making progress.
 
-Per step, the OPD correction weight is
+Per step, the OPD correction weight depends on `gate_mode`:
 
-    weight = single_criterion_weight * [A met] + single_criterion_weight * [B met]
+  gate_mode: sum  (default)
+      weight = single_criterion_weight * [A met] + single_criterion_weight * [B met]
+      i.e. with single_criterion_weight = 0.5: both met -> 1.0 (full OPD), exactly one met
+      -> 0.5 (downweighted OPD), neither met -> 0.0 (no OPD on that step).
 
-i.e. with the default single_criterion_weight = 0.5:  both met -> 1.0 (full OPD), exactly
-one met -> 0.5 (downweighted OPD), neither met -> 0.0 (no OPD on that step).
+  gate_mode: disagree_required
+      Disagreement is required; progress only sets the strength:
+          A met and B met      (disagrees, not making progress) -> disagree_no_progress_weight (1.0)
+          A met and B not met  (disagrees, making progress)     -> disagree_progress_weight    (0.5)
+          A not met            (teacher agrees)                 -> 0.0, whatever B is
+      Since B cannot matter when the teacher agrees, the progress question is only asked for
+      the steps where the teacher disagreed (asked after all agreement answers are in).
 
 All teacher prompts of an episode -- both questions for every step, and afterwards the
 logprob-scoring calls -- are issued concurrently, at most `teacher_parallel_prompts` at a
@@ -153,6 +161,11 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
         self.single_criterion_weight = task.workflow_args.get(
             "single_criterion_weight", DEFAULT_SINGLE_CRITERION_WEIGHT
         )
+        self.gate_mode = task.workflow_args.get("gate_mode", "sum")
+        if self.gate_mode not in ("sum", "disagree_required"):
+            raise ValueError(f"unknown gate_mode {self.gate_mode!r} (use 'sum' or 'disagree_required')")
+        self.disagree_no_progress_weight = task.workflow_args.get("disagree_no_progress_weight", 1.0)
+        self.disagree_progress_weight = task.workflow_args.get("disagree_progress_weight", 0.5)
         # Max teacher requests in flight per episode (1 = strictly sequential).
         self.teacher_parallel_prompts = max(
             1, int(task.workflow_args.get("teacher_parallel_prompts", DEFAULT_TEACHER_PARALLEL_PROMPTS))
@@ -339,51 +352,67 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
                 return await coro
 
         has_window = [t + self.window_size < n_total_steps for t in range(n_total_steps)]
-        agree_answers, progress_answers = await asyncio.gather(
-            asyncio.gather(
-                *[limited(self._ask_teacher_agree(memory, t, actions[t])) for t in range(n_total_steps)]
-            ),
-            asyncio.gather(
-                *[
-                    limited(self._ask_teacher_progress(memory, t, t + self.window_size - 1))
-                    for t in range(n_total_steps)
-                    if has_window[t]
-                ]
-            ),
-        )
-        progress_iter = iter(progress_answers)
+        ask_agree = [limited(self._ask_teacher_agree(memory, t, actions[t])) for t in range(n_total_steps)]
+
+        def ask_progress(steps):
+            return [limited(self._ask_teacher_progress(memory, t, t + self.window_size - 1)) for t in steps]
+
+        if self.gate_mode == "sum":
+            # Both questions for every step, all in one batch.
+            progress_steps = [t for t in range(n_total_steps) if has_window[t]]
+            agree_answers, progress_list = await asyncio.gather(
+                asyncio.gather(*ask_agree), asyncio.gather(*ask_progress(progress_steps))
+            )
+        else:
+            # disagree_required: progress only matters where the teacher disagrees, so ask
+            # the agreement question for every step first, then progress for those steps only.
+            agree_answers = await asyncio.gather(*ask_agree)
+            progress_steps = [
+                t for t in range(n_total_steps) if has_window[t] and agree_answers[t][0] is not True
+            ]
+            progress_list = await asyncio.gather(*ask_progress(progress_steps))
+        progress_answers = dict(zip(progress_steps, progress_list))
+        n_progress_known = 0
 
         for t in range(n_total_steps):
             teacher_agrees, agree_text = agree_answers[t]
-            if has_window[t]:
-                teacher_says_progress, progress_text = next(progress_iter)
-                n_windowed_calls += 1
-                if teacher_says_progress is None:
-                    n_windowed_unparseable += 1
-                windowed_response_lengths.append(len(progress_text))
-                # Criterion B: not making progress ("No" or unparseable -- fail-safe).
-                not_progress = teacher_says_progress is not True
-            else:
-                # Last window_size steps: no forward window; use the ground-truth outcome
-                # (failed episode = not making progress), as in the look-ahead variants.
-                not_progress = not bool(self._final_reward)
-
             if teacher_agrees is None:
                 n_agree_unparseable += 1
             agree_response_lengths.append(len(agree_text))
             # Criterion A: teacher disagrees with the action ("No" or unparseable -- fail-safe).
             disagree = teacher_agrees is not True
 
-            weight = self.single_criterion_weight * (int(disagree) + int(not_progress))
+            not_progress = None  # unknown: not asked (teacher agreed, in disagree_required mode)
+            if t in progress_answers:
+                teacher_says_progress, progress_text = progress_answers[t]
+                n_windowed_calls += 1
+                if teacher_says_progress is None:
+                    n_windowed_unparseable += 1
+                windowed_response_lengths.append(len(progress_text))
+                # Criterion B: not making progress ("No" or unparseable -- fail-safe).
+                not_progress = teacher_says_progress is not True
+            elif not has_window[t]:
+                # Last window_size steps: no forward window; use the ground-truth outcome
+                # (failed episode = not making progress), as in the look-ahead variants.
+                not_progress = not bool(self._final_reward)
+
+            if self.gate_mode == "sum":
+                weight = self.single_criterion_weight * (int(disagree) + int(not_progress))
+            elif not disagree:
+                weight = 0.0
+            else:
+                weight = self.disagree_no_progress_weight if not_progress else self.disagree_progress_weight
             n_disagree += int(disagree)
-            n_not_progress += int(not_progress)
 
             response = turn_responses[t]
             response.opd_gate_weight = weight  # consumed in the logprobs loop below
             if response.metrics is None:
                 response.metrics = {}
             response.metrics["opd_gate_disagree"] = float(disagree)
-            response.metrics["opd_gate_not_progress"] = float(not_progress)
+            if not_progress is not None:
+                n_progress_known += 1
+                n_not_progress += int(not_progress)
+                response.metrics["opd_gate_not_progress"] = float(not_progress)
             gate_weights.append(weight)
 
         # ---- Pass 3: teacher logprobs, blend by weight, fill experience. ----
@@ -453,18 +482,26 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
                 sum(gate_weights) / len(gate_weights) if gate_weights else 0.0
             )
             if n_total_steps:
-                both = self.single_criterion_weight * 2
+                # "full" = the weight for both criteria met, "half" = any weight in between.
+                full = (
+                    self.single_criterion_weight * 2
+                    if self.gate_mode == "sum"
+                    else self.disagree_no_progress_weight
+                )
                 last_response.metrics["opd_gate_full_rate"] = (
-                    sum(w == both for w in gate_weights) / n_total_steps
+                    sum(w == full for w in gate_weights) / n_total_steps
                 )
                 last_response.metrics["opd_gate_half_rate"] = (
-                    sum(w == self.single_criterion_weight for w in gate_weights) / n_total_steps
+                    sum(0.0 < w < full for w in gate_weights) / n_total_steps
                 )
                 last_response.metrics["opd_gate_none_rate"] = (
                     sum(w == 0.0 for w in gate_weights) / n_total_steps
                 )
                 last_response.metrics["opd_gate_disagree_rate"] = n_disagree / n_total_steps
-                last_response.metrics["opd_gate_not_progress_rate"] = n_not_progress / n_total_steps
+                # Over the steps where the progress criterion was evaluated (in
+                # disagree_required mode: only the steps the teacher disagreed with).
+                if n_progress_known:
+                    last_response.metrics["opd_gate_not_progress_rate"] = n_not_progress / n_progress_known
                 last_response.metrics["consistency_parse_success_rate"] = (
                     1.0 - n_agree_unparseable / n_total_steps
                 )
@@ -473,8 +510,8 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
                 ) / len(agree_response_lengths)
                 last_response.metrics["consistency_response_length_max"] = max(agree_response_lengths)
             last_response.metrics["n_windowed_gate_decisions"] = n_windowed_calls
-            last_response.metrics["n_outcome_gate_decisions"] = (
-                n_total_steps - n_windowed_calls
+            last_response.metrics["n_outcome_gate_decisions"] = sum(
+                1 for t in range(n_total_steps) if not has_window[t]
             )
             if n_windowed_calls:
                 last_response.metrics["progress_parse_success_rate"] = (

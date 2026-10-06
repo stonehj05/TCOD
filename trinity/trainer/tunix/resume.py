@@ -15,6 +15,7 @@ pytree leaf in jax.tree_util.tree_leaves order (verified against the shapes on l
 
 import json
 import os
+import shutil
 import time
 from typing import Any, Dict
 
@@ -27,14 +28,33 @@ def _leaves(tree):
     return jax.tree_util.tree_leaves(tree)
 
 
-def export_state(worker: Any, out_dir: str, expected_step: int) -> Dict:
-    """Write worker.params / worker.opt_state / worker.step to out_dir (atomically)."""
+def export_state(worker: Any, out_dir: str, expected_step: int, prune_others: bool = False) -> Dict:
+    """Write worker.params / worker.opt_state / worker.step to out_dir (atomically).
+
+    Idempotent: if out_dir already holds this step's state it is left as is. With
+    prune_others, every other state next to out_dir (older steps, leftover .tmp dirs) is
+    removed afterwards. Everything here runs on the worker's own host: callers on other
+    hosts must not stat or list these directories themselves, because over NFS a directory
+    that was just created can still look missing to another client.
+    """
     import jax
 
     if worker.step != expected_step:
         raise RuntimeError(f"worker is at step {worker.step}, expected {expected_step}; not exporting")
+    out_dir = out_dir.rstrip("/")
+    meta_path = os.path.join(out_dir, "meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            done = json.load(f)
+        if done.get("step") == expected_step:
+            if prune_others:
+                _prune_siblings(out_dir)
+            return {"step": done["step"], "params": len(done["params"]), "opt_state": len(done["opt_state"]),
+                    "seconds": 0.0, "already_saved": True}
+        raise FileExistsError(f"{out_dir} holds step {done.get('step')}, not {expected_step}")
     t0 = time.time()
-    tmp = out_dir.rstrip("/") + ".tmp"
+    tmp = out_dir + ".tmp"
+    shutil.rmtree(tmp, ignore_errors=True)  # leftover of an interrupted export
     meta = {"step": worker.step, "params": [], "opt_state": []}
     for name, tree in (("params", worker.params), ("opt_state", worker.opt_state)):
         os.makedirs(os.path.join(tmp, name), exist_ok=True)
@@ -45,18 +65,31 @@ def export_state(worker: Any, out_dir: str, expected_step: int) -> Dict:
     meta["seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(tmp, "meta.json"), "w") as f:
         json.dump(meta, f)
-    if os.path.exists(out_dir):
-        raise FileExistsError(out_dir)
     os.rename(tmp, out_dir)
+    if prune_others:
+        _prune_siblings(out_dir)
     return {"step": meta["step"], "params": len(meta["params"]), "opt_state": len(meta["opt_state"]),
             "seconds": meta["seconds"]}
+
+
+def _prune_siblings(keep_dir: str) -> None:
+    """Remove every other state dir (and leftover .tmp) next to keep_dir."""
+    parent, keep = os.path.dirname(keep_dir), os.path.basename(keep_dir)
+    for d in os.listdir(parent):
+        if d.startswith("global_step_") and d != keep:
+            shutil.rmtree(os.path.join(parent, d), ignore_errors=True)
 
 
 def load_state(worker: Any, in_dir: str) -> int:
     """Replace worker.params / worker.opt_state / worker.step with the state in in_dir."""
     import jax
 
-    with open(os.path.join(in_dir, "meta.json")) as f:
+    meta_path = os.path.join(in_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        raise FileNotFoundError(
+            f"no exact training state at {in_dir}; the HF checkpoint alone (bf16 weights, no "
+            "optimizer state) cannot resume the run faithfully")
+    with open(meta_path) as f:
         meta = json.load(f)
     restored = {}
     for name, template in (("params", worker.params), ("opt_state", worker.opt_state)):

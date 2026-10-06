@@ -11,7 +11,6 @@ path and the vLLM-TPU engines load it (vllm_tpu_worker.py).
 """
 
 import os
-import shutil
 from collections import defaultdict
 from typing import Dict, List
 
@@ -103,11 +102,8 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         if self.config.continue_from_checkpoint and os.path.exists(self.local_latest_checkpointed_iteration):
             with open(self.local_latest_checkpointed_iteration) as f:
                 resume_step = int(f.read().strip())
+            # Existence is checked by the worker when it loads the state (it owns the files).
             state_dir = resume.resume_state_dir(sync_checkpoint_root(self.config), resume_step)
-            if not os.path.exists(os.path.join(state_dir, "meta.json")):
-                raise FileNotFoundError(
-                    f"no exact training state for step {resume_step} at {state_dir}; the HF checkpoint "
-                    "alone (bf16 weights, no optimizer state) cannot resume the run faithfully")
         os.makedirs(self.default_local_dir, exist_ok=True)
         n_chips = self.config.cluster.trainer_gpu_num
         resources = {"TPU": n_chips}
@@ -192,15 +188,11 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         os.makedirs(step_dir, exist_ok=True)
         with open(os.path.join(step_dir, ".full_checkpoint"), "w") as f:
             f.write("")
-        # Exact state for resuming (latest full checkpoint only: ~12 B/param on tmpfs).
-        root = sync_checkpoint_root(self.config)
-        state_dir = resume.resume_state_dir(root, self.train_step_num)
-        if not os.path.exists(state_dir):
-            ray.get(self.worker.export_state.remote(state_dir))
-        parent = os.path.dirname(state_dir)
-        for d in os.listdir(parent):
-            if d.startswith("global_step_") and os.path.join(parent, d) != state_dir:
-                shutil.rmtree(os.path.join(parent, d), ignore_errors=True)
+        # Exact state for resuming (latest full checkpoint only: ~12 B/param on tmpfs). The
+        # worker writes it, skips it if already there, and prunes older states, all on its
+        # own host: this actor may run on another VM and must not touch that directory.
+        state_dir = resume.resume_state_dir(sync_checkpoint_root(self.config), self.train_step_num)
+        ray.get(self.worker.export_state.remote(state_dir))
         with open(self.local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.train_step_num))
         self._last_checkpoint_step = self.train_step_num

@@ -213,7 +213,9 @@ class TunixActorWorker:
         """Exact training state (fp32 params, optimizer, step) for resuming; see tunix/resume.py."""
         from trinity.trainer.tunix import resume
 
-        return resume.export_state(self, out_dir, self.step)
+        # Keeps only this state: older ones (and interrupted exports) are removed here, on
+        # the worker's host, never by the Trainer actor (which may see the dir over NFS).
+        return resume.export_state(self, out_dir, self.step, prune_others=True)
 
     def load_state(self, in_dir: str) -> int:
         from trinity.trainer.tunix import resume

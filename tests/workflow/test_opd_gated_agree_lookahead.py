@@ -77,7 +77,7 @@ class Teacher:
         return torch.full((len(tokens) - 1,), -3.0)
 
 
-def run(success, agree, progress, parallel=16):
+def run(success, agree, progress, parallel=16, mode="sum"):
     task = types.SimpleNamespace(workflow_args={"max_env_steps": N_STEPS, "progress_window_size": WINDOW},
                                  rollout_args=types.SimpleNamespace(), format_args=None, raw_task={}, task_desc="x", is_eval=False)
     wf = M.OPDGatedAlfworldWorkflowAgreeLookahead.__new__(M.OPDGatedAlfworldWorkflowAgreeLookahead)
@@ -87,6 +87,7 @@ def run(success, agree, progress, parallel=16):
     wf.progress_max_tokens = wf.consistency_max_tokens = 512
     wf.single_criterion_weight = 0.5
     wf.teacher_parallel_prompts = parallel
+    wf.gate_mode, wf.disagree_no_progress_weight, wf.disagree_progress_weight = mode, 1.0, 0.5
     type(wf).rollout_args = property(lambda self: {})
     exps = asyncio.run(wf._run_episode(Env(success)))
     return wf, exps
@@ -128,7 +129,48 @@ def main():
     # unparseable progress answer counts as "not making progress" (fail-safe)
     wf, exps = run(True, [True] * 8, [None] * 8)
     assert [e.metrics["opd_gate_weight"] for e in exps] == [0.5] * 5 + [0.0] * 3
+    check_disagree_required(agree, progress)
     print("ALL OK")
+
+
+def check_disagree_required(agree, progress):
+    """gate_mode=disagree_required: disagree & not-progress -> 1.0, disagree & progress -> 0.5,
+    teacher agrees -> 0 whatever the progress answer; progress is asked only where it matters."""
+    #            t:  0      1      2      3      4     | 5      6      7   (no window)
+    # agree      = [True,  False, True,  False, None,   True,  False, True]   (None = unparseable = disagree)
+    # progress   = [True,  True,  False, False, True,   -      -      -   ]
+    wf, exps = run(False, agree, progress, mode="disagree_required")       # failed episode
+    w = [e.metrics["opd_gate_weight"] for e in exps]
+    #  t0 agrees -> 0 | t1 disagree+progress -> .5 | t2 agrees (not-progress ignored) -> 0 | t3 disagree+not -> 1
+    #  t4 unparseable=disagree + progress -> .5 | t5 agrees -> 0 | t6 disagree, failed outcome -> 1 | t7 agrees -> 0
+    assert w == [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.0], w
+    for e, wt in zip(exps, w):
+        assert torch.allclose(e.teacher_logprobs, torch.full((3,), -1.0 - 2.0 * wt))
+    t = wf.teacher_model
+    assert sorted(c for c in t.calls if c[0] == "agree") == [("agree", i) for i in range(8)]
+    # progress asked only for windowed steps the teacher disagreed with: 1, 3, 4
+    assert sorted(c for c in t.calls if c[0] == "progress") == [("progress", 1), ("progress", 3), ("progress", 4)], t.calls
+    m = exps[-1].metrics
+    assert (m["opd_gate_full_rate"], m["opd_gate_half_rate"], m["opd_gate_none_rate"]) == (2 / 8, 2 / 8, 4 / 8)
+    assert m["opd_gate_disagree_rate"] == 4 / 8 and m["n_windowed_gate_decisions"] == 3 and m["n_outcome_gate_decisions"] == 3
+    assert "opd_gate_not_progress" not in exps[0].metrics and exps[3].metrics["opd_gate_not_progress"] == 1.0
+    print("disagree_required, failed  ", w)
+    wf, exps = run(True, agree, progress, mode="disagree_required")        # successful episode
+    w = [e.metrics["opd_gate_weight"] for e in exps]
+    # tail steps count as "making progress": t6 disagree -> 0.5 instead of 1.0
+    assert w == [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 0.5, 0.0], w
+    print("disagree_required, success ", w)
+    # teacher agrees everywhere -> no OPD at all, and no progress question is asked
+    wf, exps = run(False, [True] * 8, [False] * 8, mode="disagree_required")
+    assert [e.metrics["opd_gate_weight"] for e in exps] == [0.0] * 8
+    assert not [c for c in wf.teacher_model.calls if c[0] == "progress"]
+    # unparseable progress answer for a disagreed step counts as not-progress -> full weight
+    wf, exps = run(True, [False] * 8, [None] * 8, mode="disagree_required")
+    assert [e.metrics["opd_gate_weight"] for e in exps] == [1.0] * 5 + [0.5] * 3
+    for cap in (1, 3):
+        wf_c, exps_c = run(False, agree, progress, parallel=cap, mode="disagree_required")
+        assert wf_c.teacher_model.max_inflight == cap
+        assert [e.metrics["opd_gate_weight"] for e in exps_c] == [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.0]
 
 
 if __name__ == "__main__":

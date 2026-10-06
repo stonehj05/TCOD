@@ -181,7 +181,11 @@ class Synchronizer:
                         # Engines may still be loading `current_model_version`; everything
                         # older is superseded. Full checkpoints live elsewhere (on disk).
                         root = sync_checkpoint_root(self.config)
-                        for d in os.listdir(root):
+                        try:  # written on the trainer's host; may not be visible here yet (NFS)
+                            entries = os.listdir(root)
+                        except FileNotFoundError:
+                            entries = []
+                        for d in entries:
                             step = d.rsplit("_", 1)[-1]
                             if d.startswith("global_step_") and step.isdigit() and int(step) < current_model_version:
                                 shutil.rmtree(os.path.join(root, d), ignore_errors=True)
