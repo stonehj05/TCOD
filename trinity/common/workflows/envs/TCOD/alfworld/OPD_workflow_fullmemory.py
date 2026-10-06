@@ -90,6 +90,9 @@ class OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory(Workflow):
         self.temperature = task.workflow_args.get("temperature", 1.0)
         self.max_env_steps = task.workflow_args.get("max_env_steps", 30)
         self.is_eval = task.is_eval
+        # TPU trainer only (trainer_type: tunix): leave the teacher scoring to the trainer, which
+        # then scores only the turns it samples (trinity/trainer/tunix/teacher_gate.py).
+        self.defer_teacher = bool(task.workflow_args.get("defer_teacher", False))
 
     def reset(self, task: Task):
         """Reset the workflow with a new task.
@@ -209,6 +212,23 @@ class OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory(Workflow):
         # this turn's user message (not a single self-contained turn as in
         # OPD_workflow.py) -- same input the student had.
         per_turn_kl_sums: List[float] = []
+        if self.defer_teacher:
+            for i, response in enumerate(turn_responses):
+                if response.info is None:
+                    response.info = {}
+                response.info["opd_deferred"] = {
+                    "step": i,
+                    "gate": {"gate_mode": "always", "temperature": self.temperature},
+                }
+                if response.metrics is None:
+                    response.metrics = {}
+                response.reward = self.compute_reward(response)
+                response.eid.run = getattr(self, "run_id_base", 0)
+                response.eid.step = i
+            if turn_responses:
+                turn_responses[-1].metrics["env_rounds"] = self._env_rounds
+                turn_responses[-1].metrics["env_done"] = 1.0 if self._env_done else 0.0
+            return turn_responses
         for i, response in enumerate(turn_responses):
             teacher_logprobs = await self.teacher_model.logprobs_async(
                 tokens=response.tokens.tolist(),  # full input = prefix + student's response

@@ -1,0 +1,123 @@
+# Vanilla OPD (OPD_alfworld_workflow_fullmemory: the teacher scores every trained turn, no gate),
+# plain Qwen3-4B student / plain Qwen3-30B-A3B teacher, with DEFERRED TEACHER SCORING
+# (defer_teacher: true): the explorer only plays the games and the trainer has the teacher score
+# the 64 turns of each training batch (trinity/trainer/tunix/teacher_gate.py). Same settings as
+# the GPU opd_fullmemory.yaml otherwise; 250 training steps, no intermediate checkpoints.
+#
+# checkpoint_root_dir is on worker 0's tmpfs (NFS-shared by start_cluster.sh) because worker 0's
+# disk was full when this was launched: the final checkpoint is lost on a reboot of the VM.
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Bring-up and launch:
+#   WORKER_ROLES="trainer teacher teacher explorer" TEACHER_MODEL=Qwen/Qwen3-30B-A3B \
+#     bash ~/TCOD/scripts/tpu/start_cluster.sh
+#   cd ~/TCOD && PATH=$HOME/venv-vllm-tpu/bin:$PATH setsid nohup \
+#     trinity run --config TCOD_examples/alfworld/opd_fullmemory_deferred_tpu.yaml > ~/train.log 2>&1 < /dev/null &
+# See scripts/tpu/README.md.
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_fullmemory_deferred_tpu"
+checkpoint_root_dir: /dev/shm/tcod_sync/runs
+continue_from_checkpoint: false  # TPU: set true to resume from the latest full checkpoint
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_lookahead.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (see header); the run ends on trainer.total_steps
+  # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
+  # opd_gated_disagree_lookahead_tpu.yaml uses 8).
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/tcod_tasks/train.jsonl  # TPU VM copy (game_file paths remapped)
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # The trainer has the teacher score the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+    default_workflow_type: 'OPD_alfworld_workflow_fullmemory'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_fullmemory_deferred_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_fullmemory_deferred_tpu_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_lookahead.yaml. Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory).
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4 (fits; 321k-token KV cache)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250
+  save_interval: 100000  # no intermediate checkpoints; the final one is saved at step 250
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

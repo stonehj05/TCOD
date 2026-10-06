@@ -88,6 +88,10 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         self._last_state_dict_step = 0
         self._last_checkpoint_step = 0
         self.worker = None
+        # workflow_args.defer_teacher: the teacher gates and scores sampled turns here.
+        from trinity.trainer.tunix.teacher_gate import DeferredTeacherGate
+
+        self.teacher_gate = DeferredTeacherGate(config)
 
     async def prepare(self) -> None:
         from transformers import AutoTokenizer
@@ -136,6 +140,9 @@ class TunixTrainerWrapper(TrainEngineWrapper):
     def _to_row(exp: Experience) -> Dict[str, np.ndarray]:
         tokens = np.asarray(exp.tokens, dtype=np.int32)
         response = tokens[exp.prompt_length:]
+        if exp.teacher_logprobs is None:
+            raise ValueError("experience has no teacher_logprobs (defer_teacher set in the "
+                             "workflow but not seen by the trainer?)")
         teacher = np.asarray(exp.teacher_logprobs, dtype=np.float32)
         if len(teacher) != len(response):
             raise ValueError(f"teacher_logprobs ({len(teacher)}) != response length ({len(response)})")
@@ -145,12 +152,14 @@ class TunixTrainerWrapper(TrainEngineWrapper):
                 "response_mask": mask, "teacher_logprobs": teacher}
 
     async def train_step(self, batch_exps: List[Experience]) -> Dict:
+        gate_metrics = await self.teacher_gate.annotate(batch_exps) if self.teacher_gate.enabled else {}
         rows = [self._to_row(e) for e in batch_exps]
         max_resp = self.config.model.max_response_tokens
         for r in rows:  # responses are generated with max_tokens=max_response_tokens
             if len(r["response"]) > max_resp:
                 raise ValueError(f"response of {len(r['response'])} tokens > max_response_tokens={max_resp}")
         metrics = await self.worker.train_step.remote(rows)
+        metrics.update(gate_metrics)
         # MultiTurnOpdAdvantage's trajectory metrics: per-turn KL (old - teacher) summed per run.
         row_kl = metrics.pop("_row_kl")
         traj = defaultdict(float)

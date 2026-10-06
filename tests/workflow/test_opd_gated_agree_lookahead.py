@@ -77,7 +77,7 @@ class Teacher:
         return torch.full((len(tokens) - 1,), -3.0)
 
 
-def run(success, agree, progress, parallel=16, mode="sum"):
+def run(success, agree, progress, parallel=16, mode="sum", defer=False):
     task = types.SimpleNamespace(workflow_args={"max_env_steps": N_STEPS, "progress_window_size": WINDOW},
                                  rollout_args=types.SimpleNamespace(), format_args=None, raw_task={}, task_desc="x", is_eval=False)
     wf = M.OPDGatedAlfworldWorkflowAgreeLookahead.__new__(M.OPDGatedAlfworldWorkflowAgreeLookahead)
@@ -88,6 +88,7 @@ def run(success, agree, progress, parallel=16, mode="sum"):
     wf.single_criterion_weight = 0.5
     wf.teacher_parallel_prompts = parallel
     wf.gate_mode, wf.disagree_no_progress_weight, wf.disagree_progress_weight = mode, 1.0, 0.5
+    wf.defer_teacher, wf._final_reward = defer, 0.0
     type(wf).rollout_args = property(lambda self: {})
     exps = asyncio.run(wf._run_episode(Env(success)))
     return wf, exps
@@ -130,7 +131,105 @@ def main():
     wf, exps = run(True, [True] * 8, [None] * 8)
     assert [e.metrics["opd_gate_weight"] for e in exps] == [0.5] * 5 + [0.0] * 3
     check_disagree_required(agree, progress)
+    check_deferred(agree, progress)
     print("ALL OK")
+
+
+class TeacherActor:
+    """The Teacher above behind a Ray-actor-like interface (`.chat.remote(...)`), recording prompts."""
+
+    def __init__(self, teacher):
+        self.t, self.prompts = teacher, []
+        self.chat = types.SimpleNamespace(remote=self._chat)
+        self.logprobs = types.SimpleNamespace(remote=self._logprobs)
+
+    async def _chat(self, messages, lora_request=None, **kw):
+        self.prompts.append((messages, kw))
+        return await self.t.chat_async(messages, **kw)
+
+    async def _logprobs(self, tokens, temperature=None):
+        return await self.t.logprobs_async(tokens, temperature=temperature)
+
+
+def check_deferred(agree, progress):
+    """defer_teacher: the explorer makes no teacher call; the trainer-side gate then gives every
+    turn the same prompts, weight and teacher_logprobs as the explorer-side gate, also when it
+    sees an arbitrary subset of an episode's turns in arbitrary order."""
+    import pickle
+    import random
+
+    from trinity.trainer.tunix.teacher_gate import DeferredTeacherGate
+
+    def gate(teachers, **args):
+        cfg = types.SimpleNamespace(
+            buffer=types.SimpleNamespace(explorer_input=types.SimpleNamespace(taskset=None, tasksets=[types.SimpleNamespace(
+                workflow_args={"defer_teacher": True, **args})])),  # as after config validation
+            explorer=types.SimpleNamespace(name="explorer", auxiliary_models=[types.SimpleNamespace(engine_num=len(teachers))]),
+            ray_namespace="x")
+        return DeferredTeacherGate(cfg, teachers=teachers)
+
+    for mode in ("sum", "disagree_required"):
+        for success in (False, True):
+            # reference: explorer-side gate, recording the prompts the teacher saw
+            ref_wf, ref = run(success, agree, progress, mode=mode)
+            rec = TeacherActor(Teacher(agree, progress))
+            wf_d, exps = run(success, agree, progress, mode=mode, defer=True)
+            assert not wf_d.teacher_model.calls and not wf_d.teacher_model.scored, "explorer must not call the teacher"
+            assert all(e.teacher_logprobs is None and "opd_deferred" in e.info for e in exps)
+            assert [e.eid.step for e in exps] == list(range(8)) and exps[-1].metrics["env_rounds"] == 8
+            exps = pickle.loads(pickle.dumps(exps))          # as stored in / read from the buffer
+            order = list(range(8)); random.Random(mode + str(success)).shuffle(order)
+            g = gate([rec, rec])
+            assert g.enabled
+            m = asyncio.run(g.annotate([exps[i] for i in order]))
+            for e_ref, e in zip(ref, exps):
+                assert e.metrics["opd_gate_weight"] == e_ref.metrics["opd_gate_weight"], (mode, success, e.eid.step)
+                assert torch.allclose(e.teacher_logprobs, e_ref.teacher_logprobs)
+                assert e.metrics.get("opd_gate_not_progress") == e_ref.metrics.get("opd_gate_not_progress")
+                assert "opd_deferred" not in e.info and bool(e.teacher_logprobs_valid_mask.all())
+            # same teacher questions as the explorer-side gate (set of (kind, step) calls)
+            assert sorted(rec.t.calls) == sorted(ref_wf.teacher_model.calls), (mode, success)
+            assert sorted(rec.t.scored) == list(range(1, 9))
+            w = [e.metrics["opd_gate_weight"] for e in exps]
+            assert abs(m["teacher_gate/opd_gate_apply_rate"] - sum(w) / 8) < 1e-9
+            assert m["teacher_gate/progress_prompts"] == sum(c[0] == "progress" for c in rec.t.calls)
+            assert abs(m["teacher_gate/opd_gate_none_rate"] - ref[-1].metrics["opd_gate_none_rate"]) < 1e-9
+            assert abs(m["teacher_gate/opd_gate_full_rate"] - ref[-1].metrics["opd_gate_full_rate"]) < 1e-9
+    # prompts are identical message for message to what the workflow's own methods send
+    wf, _ = run(False, agree, progress, mode="sum")
+    sent = []
+    async def record(messages, **kw):
+        sent.append((messages, kw)); return [types.SimpleNamespace(response_text="<answer>No</answer>")]
+    wf.teacher_model = types.SimpleNamespace(chat_async=record)
+    wf_d, exps = run(False, agree, progress, mode="sum", defer=True)
+    mem = M.payload_memory(exps[0].info["opd_deferred"])   # turn 0 keeps the conversation through its window
+    assert len(mem) == 2 * WINDOW
+    full = M.payload_memory(exps[2].info["opd_deferred"])  # turn 2: through its window (steps 2..4)
+    assert len(full) == 2 * (2 + WINDOW)
+    assert len(M.payload_memory(exps[7].info["opd_deferred"])) == 15  # tail turn: up to its user message
+    asyncio.run(wf._ask_teacher_agree(full, 2, "act3")); asyncio.run(wf._ask_teacher_progress(full, 2, 4))
+    rec = TeacherActor(Teacher(agree, progress))
+    asyncio.run(gate([rec]).annotate([exps[2]]))
+    assert [p[0] for p in rec.prompts] == [s_[0] for s_ in sent], "trainer-side prompts differ from the workflow's"
+    assert [p[1] for p in rec.prompts] == [{"temperature": 0.0, "max_tokens": 512, "n": 1}] * 2
+    # skip_zero_weight_scoring: weight-0 turns are not scored and get the student's own logprobs
+    wf_d, exps = run(False, agree, progress, mode="disagree_required", defer=True)
+    rec = TeacherActor(Teacher(agree, progress))
+    m = asyncio.run(gate([rec], skip_zero_weight_scoring=True).annotate(exps))
+    w = [e.metrics["opd_gate_weight"] for e in exps]
+    assert w == [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.0]
+    assert sorted(rec.t.scored) == [2, 4, 5, 7] and m["teacher_gate/scored_turns"] == 4
+    for e, wt in zip(exps, w):
+        assert torch.allclose(e.teacher_logprobs, torch.full((3,), -1.0 - 2.0 * wt))
+    # per-engine request cap
+    rec = TeacherActor(Teacher(agree, progress))
+    wf_d, exps = run(False, agree, progress, mode="sum", defer=True)
+    asyncio.run(gate([rec], trainer_teacher_parallel_prompts=3).annotate(exps))
+    assert rec.t.max_inflight == 3, rec.t.max_inflight
+    # a batch without deferred turns is left alone
+    assert asyncio.run(gate([rec]).annotate(ref)) == {}
+    check_vanilla_deferred(gate)
+    print("deferred (trainer-side) gate == explorer-side gate")
 
 
 def check_disagree_required(agree, progress):
@@ -171,6 +270,31 @@ def check_disagree_required(agree, progress):
         wf_c, exps_c = run(False, agree, progress, parallel=cap, mode="disagree_required")
         assert wf_c.teacher_model.max_inflight == cap
         assert [e.metrics["opd_gate_weight"] for e in exps_c] == [0.0, 0.5, 0.0, 1.0, 0.5, 0.0, 1.0, 0.0]
+
+
+
+def check_vanilla_deferred(gate):
+    """Vanilla OPD with defer_teacher: trainer-side scoring stores exactly what the workflow stores."""
+    import trinity.common.workflows.envs.TCOD.alfworld.OPD_workflow_fullmemory as V
+
+    def run_v(defer):
+        wf = V.OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory.__new__(V.OnPolicyDistillVerlAgentAlfworldWorkflowFullMemory)
+        wf.task = types.SimpleNamespace(rollout_args=types.SimpleNamespace())
+        wf.model, wf.teacher_model = Student(), Teacher([], [])
+        wf.temperature, wf.max_env_steps, wf.defer_teacher = 1.0, N_STEPS, defer
+        type(wf).rollout_args = property(lambda self: {})
+        return wf, asyncio.run(wf._run_episode(Env(False)))
+
+    _, ref = run_v(False)
+    wf, exps = run_v(True)
+    assert not wf.teacher_model.scored and all(e.teacher_logprobs is None for e in exps)
+    rec = TeacherActor(Teacher([], []))
+    m = asyncio.run(gate([rec]).annotate(exps[::-1]))
+    assert not rec.prompts and sorted(rec.t.scored) == list(range(1, 9)) and m["teacher_gate/scored_turns"] == 8
+    assert "teacher_gate/agree_prompts" not in m
+    for a, b in zip(ref, exps):
+        assert torch.equal(a.teacher_logprobs, b.teacher_logprobs) and a.eid.step == b.eid.step and a.reward == b.reward
+    print("vanilla OPD: trainer-side scoring == explorer-side scoring")
 
 
 if __name__ == "__main__":

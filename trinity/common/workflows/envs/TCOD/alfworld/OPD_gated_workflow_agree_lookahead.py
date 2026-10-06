@@ -43,10 +43,22 @@ student's own, `student + weight * (teacher - student)`, which scales the advant
 exactly `weight` through the unmodified shared advantage function. weight = 0 therefore
 gives zero advantage on that step. Per-turn `kl_divergence` metrics use the raw teacher
 logprobs.
+
+defer_teacher: true  (TPU trainer only, trainer_type: tunix)
+    The explorer then only plays the game: no teacher prompt and no teacher scoring here.
+    Each turn carries what the gate needs (`info["opd_deferred"]`, see `deferred_payload`):
+    the conversation up to the end of its look-ahead window, its action and the episode
+    outcome. The trainer asks the teacher the same questions and scores the turn, but only
+    for the turns it actually samples into a training batch
+    (trinity/trainer/tunix/teacher_gate.py). Prompts, parsing and weights are the functions
+    of this module in both places, so a turn gets the same weight either way; most turns an
+    explore step produces are never sampled, and their teacher work is simply not done.
 """
 
 import asyncio
+import json
 import string
+import zlib
 from dataclasses import asdict
 from typing import Dict, List, Optional
 
@@ -116,6 +128,75 @@ def parse_yes_no(response: str) -> Optional[bool]:
         return None
 
 
+def agree_messages(memory: List[Dict[str, str]], step: int, action: str) -> List[Dict[str, str]]:
+    """Agreement prompt for step `step` (0-indexed): the conversation up to and including that
+    step's user message, with the yes/no addendum appended to it (the student's own response
+    for that step is not shown). Same construction as OPD_gated_workflow_fullmemory.py."""
+    context = memory[: 2 * step + 1]
+    return context[:-1] + [
+        {
+            "role": "user",
+            "content": context[-1]["content"] + YES_NO_ADDENDUM.format(student_action=action),
+        }
+    ]
+
+
+def progress_messages(
+    memory: List[Dict[str, str]], window_start: int, window_end: int
+) -> List[Dict[str, str]]:
+    """Progress prompt for steps [window_start, window_end] (0-indexed, inclusive): the
+    conversation through the end of the window, then the question. Identical to
+    OPD_gated_workflow_lookahead_soft.py's version."""
+    context = memory[: 2 * (window_end + 1)]
+    return context + [
+        {
+            "role": "user",
+            "content": PROGRESS_ADDENDUM.format(
+                window_len=window_end - window_start + 1,
+                start_step=window_start + 1,
+                end_step=window_end + 1,
+            ),
+        }
+    ]
+
+
+def gate_weight(gate: Dict, disagree: bool, not_progress: Optional[bool]) -> float:
+    """OPD correction weight of one step. `gate` holds gate_mode and its weights;
+    `not_progress` may be None only where it cannot matter (teacher agreed, disagree_required)."""
+    if gate["gate_mode"] == "sum":
+        return gate["single_criterion_weight"] * (int(disagree) + int(not_progress))
+    if not disagree:
+        return 0.0
+    return gate["disagree_no_progress_weight"] if not_progress else gate["disagree_progress_weight"]
+
+
+def deferred_payload(
+    memory: List[Dict[str, str]], step: int, n_steps: int, action: str, final_reward: float, gate: Dict
+) -> Dict:
+    """What the trainer needs to gate and score turn `step` by itself (defer_teacher mode).
+
+    The conversation is kept through the end of the step's look-ahead window (the progress
+    prompt's context; the agreement prompt's context is a prefix of it), or only up to the
+    step's user message for the final `window_size` steps, which use the outcome instead.
+    Stored zlib-compressed: the full-memory conversation repeats in every turn of a game.
+    """
+    has_window = step + gate["window_size"] < n_steps
+    keep = 2 * (step + gate["window_size"]) if has_window else 2 * step + 1
+    return {
+        "step": step,
+        "n_steps": n_steps,
+        "action": action,
+        "final_reward": float(final_reward),
+        "has_window": has_window,
+        "memory_z": zlib.compress(json.dumps(memory[:keep]).encode()),
+        "gate": gate,
+    }
+
+
+def payload_memory(payload: Dict) -> List[Dict[str, str]]:
+    return json.loads(zlib.decompress(payload["memory_z"]))
+
+
 @WORKFLOWS.register_module("OPD_gated_alfworld_workflow_agree_lookahead")
 class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
     """Agreement + look-ahead gated on-policy distillation workflow for AlfWorld.
@@ -170,6 +251,23 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
         self.teacher_parallel_prompts = max(
             1, int(task.workflow_args.get("teacher_parallel_prompts", DEFAULT_TEACHER_PARALLEL_PROMPTS))
         )
+        # Leave every teacher call to the trainer (see module docstring).
+        self.defer_teacher = bool(task.workflow_args.get("defer_teacher", False))
+
+    def gate_config(self) -> Dict:
+        """Everything that determines a step's weight and the teacher calls behind it."""
+        return {
+            "gate_mode": self.gate_mode,
+            "window_size": self.window_size,
+            "single_criterion_weight": self.single_criterion_weight,
+            "disagree_no_progress_weight": self.disagree_no_progress_weight,
+            "disagree_progress_weight": self.disagree_progress_weight,
+            "consistency_temperature": self.consistency_temperature,
+            "consistency_max_tokens": self.consistency_max_tokens,
+            "progress_temperature": self.progress_temperature,
+            "progress_max_tokens": self.progress_max_tokens,
+            "temperature": self.temperature,
+        }
 
     def reset(self, task: Task):
         """Reset the workflow with a new task.
@@ -214,13 +312,7 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
         to and including that step's user message, with the yes/no addendum appended to it
         (the student's own response for that step is not shown).
         """
-        context = memory[: 2 * step + 1]
-        yes_no_messages = context[:-1] + [
-            {
-                "role": "user",
-                "content": context[-1]["content"] + YES_NO_ADDENDUM.format(student_action=action),
-            }
-        ]
+        yes_no_messages = agree_messages(memory, step, action)
         yn_responses = await self.teacher_model.chat_async(
             yes_no_messages,
             temperature=self.consistency_temperature,
@@ -237,25 +329,37 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
         0-indexed, inclusive) show genuine progress toward the task goal.
         Identical to OPD_gated_workflow_lookahead_soft.py's version.
         """
-        context = memory[: 2 * (window_end + 1)]
-        progress_messages = context + [
-            {
-                "role": "user",
-                "content": PROGRESS_ADDENDUM.format(
-                    window_len=window_end - window_start + 1,
-                    start_step=window_start + 1,
-                    end_step=window_end + 1,
-                ),
-            }
-        ]
+        prompt = progress_messages(memory, window_start, window_end)
         pr_responses = await self.teacher_model.chat_async(
-            progress_messages,
+            prompt,
             temperature=self.progress_temperature,
             max_tokens=self.progress_max_tokens,
             n=1,
         )
         response_text = pr_responses[0].response_text or ""
         return parse_yes_no(response_text), response_text
+
+    def _defer(
+        self, turn_responses: List[Experience], actions: List[str], memory: List[Dict[str, str]]
+    ) -> List[Experience]:
+        """defer_teacher: return the rollout with the gate's inputs attached and no teacher
+        output; teacher_logprobs is filled by the trainer for the turns it samples."""
+        gate, n = self.gate_config(), len(turn_responses)
+        for i, response in enumerate(turn_responses):
+            if response.info is None:
+                response.info = {}
+            response.info["opd_deferred"] = deferred_payload(
+                memory, i, n, actions[i], self._final_reward, gate
+            )
+            if response.metrics is None:
+                response.metrics = {}
+            response.reward = self.compute_reward(response)
+            response.eid.run = getattr(self, "run_id_base", 0)
+            response.eid.step = i
+        if turn_responses:
+            turn_responses[-1].metrics["env_rounds"] = self._env_rounds
+            turn_responses[-1].metrics["env_done"] = 1.0 if self._env_done else 0.0
+        return turn_responses
 
     async def _run_episode(self, env) -> List[Experience]:
         observation, info = env.reset()
@@ -334,6 +438,9 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
 
         n_total_steps = len(turn_responses)
 
+        if self.defer_teacher:
+            return self._defer(turn_responses, actions, memory)
+
         # ---- Pass 2: ask the teacher both questions for every step, batched (bounded
         # concurrency), then turn the two criteria into a correction weight per step. ----
         n_agree_unparseable = 0
@@ -345,6 +452,7 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
         n_disagree = 0
         n_not_progress = 0
 
+        gate = self.gate_config()
         limiter = asyncio.Semaphore(self.teacher_parallel_prompts)
 
         async def limited(coro):
@@ -396,12 +504,7 @@ class OPDGatedAlfworldWorkflowAgreeLookahead(Workflow):
                 # (failed episode = not making progress), as in the look-ahead variants.
                 not_progress = not bool(self._final_reward)
 
-            if self.gate_mode == "sum":
-                weight = self.single_criterion_weight * (int(disagree) + int(not_progress))
-            elif not disagree:
-                weight = 0.0
-            else:
-                weight = self.disagree_no_progress_weight if not_progress else self.disagree_progress_weight
+            weight = gate_weight(gate, disagree, not_progress)
             n_disagree += int(disagree)
 
             response = turn_responses[t]
