@@ -473,8 +473,20 @@ buffer:
 - **`skip_zero_weight_scoring`:** does not score turns whose gate weight is 0. Their stored
   teacher logprobs equal the student's own either way, so training is unchanged; only the
   raw-KL diagnostic covers fewer turns. Its time saving has not been measured.
-- **What changes in training:** nothing in the gate or loss. The trainer no longer starves,
-  so every batch is exactly `max_staleness` versions old instead of a mix of 1-2.
+- **What changes in training:** nothing in the gate or loss, but with the default
+  synchronizer settings the data mix changes. Without `defer_teacher`, each explore batch
+  generated with version 2k fed two training steps: step 2k+1 took its first 64 turns
+  (1 version old), step 2k+2 the next 64 (2 versions old), and the explorer's next batch
+  was discarded as stale. Turns are written in the order games finish, so turns 1-64 are
+  mostly solved (short) games and turns 65-128 mostly failed ones. With `defer_teacher` and
+  `sync_style: dynamic_by_explorer`, the faster explorer gives every training step the
+  first 64 turns of a new batch, all 2 versions old: about twice the share of solved games.
+- **Keeping the old pattern:** set `synchronizer.sync_style: 'fixed'` and `sync_interval: 2`
+  (as in `opd_gated_disagree_lookahead_deferred_tpu.yaml`). The trainer then publishes
+  weights every 2 steps and the explorer waits for them, which gives the same 1-old / 2-old
+  alternation on turns 1-64 / 65-128 of one batch. This combination has not been run yet.
+  The vanilla test (`opd_fullmemory_deferred_tpu.yaml`) and the weight-0.8 run used the
+  free-running settings.
 
 Measured on v4-32 (4B student, two 30B-A3B teachers, disagree-required gate, 12-step test):
 explore step about 77 s instead of about 450 s; a training step end to end about 127 s

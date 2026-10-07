@@ -108,6 +108,9 @@ explorer:
 
 synchronizer:
   sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  # As used for the vanilla test run of 2026-10-06: free-running explorer, so every training step takes the first 64
+  # turns of a new batch (2 versions old). For the 1-old / 2-old pattern of the runs without
+  # the speedup use sync_style: 'fixed' with sync_interval: 2 (opd_gated_disagree_lookahead_deferred_tpu.yaml).
   sync_style: 'dynamic_by_explorer'
   sync_interval: 1
   sync_timeout: 3600
