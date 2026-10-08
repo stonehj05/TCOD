@@ -55,6 +55,15 @@ def export_state(worker: Any, out_dir: str, expected_step: int, prune_others: bo
     t0 = time.time()
     tmp = out_dir + ".tmp"
     shutil.rmtree(tmp, ignore_errors=True)  # leftover of an interrupted export
+    if prune_others:
+        # Normally the previous state is kept until the new one is complete. If the two do not
+        # fit together (tmpfs also holds sync checkpoints and Ray's object store), drop the
+        # previous one first rather than fail mid-export and stop the run.
+        os.makedirs(os.path.dirname(out_dir), exist_ok=True)
+        need = sum(int(np.prod(l.shape)) * np.dtype(l.dtype).itemsize
+                   for tree in (worker.params, worker.opt_state) for l in _leaves(tree))
+        if shutil.disk_usage(os.path.dirname(out_dir)).free < 1.1 * need:
+            _prune_siblings(out_dir)
     meta = {"step": worker.step, "params": [], "opt_state": []}
     for name, tree in (("params", worker.params), ("opt_state", worker.opt_state)):
         os.makedirs(os.path.join(tmp, name), exist_ok=True)

@@ -1,0 +1,164 @@
+# Gated OPD, DISAGREEMENT-REQUIRED + LOOK-AHEAD (OPD_gated_alfworld_workflow_agree_lookahead
+# with gate_mode: disagree_required). Per step the teacher is asked
+#   (A) would you choose the student's action?            -> "disagrees" if it answers No
+#   (B) do the next `progress_window_size` steps progress? -> asked only where it disagrees
+# OPD weight:
+#   disagrees and NOT making progress -> disagree_no_progress_weight (1.0)
+#   disagrees and making progress     -> disagree_progress_weight    (0.5)
+#   teacher agrees                    -> 0 (no OPD on that step), whatever (B) would be
+# Unparseable answers count as "No" (fail-safe). The final window uses the episode outcome
+# for (B). Everything else is identical to opd_gated_agree_lookahead_tpu.yaml.
+#
+# DEFERRED TEACHER (defer_teacher: true): same gate and weights as
+# opd_gated_disagree_lookahead_b16_tpu.yaml, but the teacher is asked by the trainer, only for
+# the 64 turns of each training batch, instead of by the explorer for every turn it generates
+# (an explore step yields ~800 turns). See trinity/trainer/tunix/teacher_gate.py.
+# buffer.total_steps is only a generous upper bound; the run ends when the trainer reaches
+# trainer.total_steps.
+#
+# SAME DATA PATTERN AS THE RUNS WITHOUT THE SPEEDUP (synchronizer: fixed, sync_interval 2):
+# in those runs every explore batch generated with model version 2k fed exactly two training
+# steps: step 2k+1 took its first 64 turns (1 version old) and step 2k+2 the next 64 turns
+# (2 versions old). Turns are written in the order games finish, so the first 64 are mostly
+# solved (short) games and the next 64 mostly failed ones. Left free-running
+# (dynamic_by_explorer, sync_interval 1), the faster explorer instead gives every training
+# step the first 64 turns of a new batch, all 2 versions old, i.e. about twice the share of
+# solved games. With the settings below the trainer publishes weights every 2 steps and the
+# explorer waits for them, which reproduces the 1-old / 2-old alternation on turns 1-64 /
+# 65-128 of one batch. NOT YET RUN: this combination was written while the chips were busy.
+#
+# TPU port (v4-32: worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students); hardware-specific settings are marked "TPU:" below. Bring-up and launch:
+#   WORKER_ROLES="trainer teacher teacher explorer" TEACHER_MODEL=Qwen/Qwen3-30B-A3B \
+#     bash ~/TCOD/scripts/tpu/start_cluster.sh
+#   cd ~/TCOD && PATH=$HOME/venv-vllm-tpu/bin:$PATH setsid nohup \
+#     trinity run --config TCOD_examples/alfworld/opd_gated_disagree_lookahead_deferred_fixed2_s150_tpu.yaml > ~/train.log 2>&1 < /dev/null &
+# See scripts/tpu/README.md.
+project: "ALFWORLD_TCOD"
+name: "alfworld_opd_gated_disagree_lookahead_deferred_fixed2_s150_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # TPU: set true to resume from the latest full checkpoint
+
+# Mechanism: trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_agree_lookahead.py
+# Same plain Qwen3-4B student / plain Qwen3-30B-A3B teacher / full-memory setup as the other
+# gated variants.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as opd_gated_lookahead.yaml.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (see header); the run ends on trainer.total_steps
+  # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
+  # opd_gated_disagree_lookahead_tpu.yaml uses 8).
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/tcod_tasks/train.jsonl  # TPU VM copy (game_file paths remapped)
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # Decoding for the windowed progress-judgment call -- same as
+        # opd_gated_lookahead.yaml (reasoning-before-answer prompt).
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        progress_window_size: 5
+        # Decoding for the agreement (yes/no) check -- same as opd_gated_fullmemory.yaml.
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+        # Disagreement is required; the progress judgment sets the strength.
+        gate_mode: disagree_required
+        disagree_no_progress_weight: 1.0
+        disagree_progress_weight: 0.5
+        # Teacher requests (both questions for all steps, then the scoring calls) sent
+        # concurrently per episode, so vLLM batches them; 1 = one prompt at a time.
+        teacher_parallel_prompts: 16
+        # The trainer gates and scores the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+        # true: do not score turns whose weight is 0 (training is identical; see teacher_gate.py)
+        skip_zero_weight_scoring: false
+    default_workflow_type: 'OPD_gated_alfworld_workflow_agree_lookahead'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_opd_gated_disagree_lookahead_deferred_fixed2_s150_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:///alfworld_opd_gated_disagree_lookahead_deferred_fixed2_s150_tpu_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as
+    # opd_gated_lookahead.yaml. Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory).
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4 (fits; 321k-token KV cache)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'fixed'   # explorer waits for new weights; see header (was dynamic_by_explorer)
+  sync_interval: 2      # trainer publishes every 2 steps; explorer syncs every 2 explore steps (the 2nd batch is unused, as before)
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250  # first leg ran to 150 (2026-10-07); continued from the step-150 state to 250
+  save_interval: 50  # TPU: disk on worker 0 (see header); GPU run: 25
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

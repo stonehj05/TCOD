@@ -239,7 +239,9 @@ def lookahead_task(
                     raise
                 time.sleep(2.0)
 
-    context = json.loads(zlib.decompress(memory_z))
+    # The teacher starts from the conversation through this step's user message (a payload
+    # may hold more: the student's following steps, for the student look-ahead).
+    context = json.loads(zlib.decompress(memory_z))[: 2 * step + 1]
     return asyncio.run(
         teacher_lookahead(ask, game_file, context, prior_actions, step, gate, student_action)
     )
@@ -277,6 +279,22 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
             "temperature": self.temperature,
         }
 
+    # Hooks for variants that add criteria to the teacher's look-ahead
+    # (OPD_gated_workflow_student_teacher_lookahead.py).
+    def _deferred_payload(self, memory, step, n_steps, actions, gate) -> Dict:
+        return deferred_payload(memory, step, n_steps, actions, self._final_reward, gate, self.task_desc)
+
+    async def _student_not_progress(self, memory, disagreed, n_total_steps, limited) -> Dict[int, bool]:
+        """step -> "the student's own next steps make no progress", for the steps where a
+        variant needs it. Not used by the plain teacher look-ahead."""
+        return {}
+
+    def _step_weight(self, gate, disagree, result, student_not_progress) -> float:
+        return lookahead_weight(gate, disagree, result["progress"] if result else None)
+
+    def _full_weight(self) -> float:
+        return self.teacher_progress_weight
+
     def _defer_lookahead(
         self, turn_responses: List[Experience], actions: List[str], memory: List[Dict[str, str]]
     ) -> List[Experience]:
@@ -284,9 +302,7 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
         for i, response in enumerate(turn_responses):
             if response.info is None:
                 response.info = {}
-            response.info["opd_deferred"] = deferred_payload(
-                memory, i, n, actions, self._final_reward, gate, self.task_desc
-            )
+            response.info["opd_deferred"] = self._deferred_payload(memory, i, n, actions, gate)
             if response.metrics is None:
                 response.metrics = {}
             response.reward = self.compute_reward(response)
@@ -376,19 +392,25 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
             *[limited(self._ask_teacher_agree(memory, t, actions[t])) for t in range(n_total_steps)]
         )
         disagreed = [t for t in range(n_total_steps) if agree_answers[t][0] is not True]
-        lookaheads = dict(zip(disagreed, await asyncio.gather(*[lookahead(t) for t in disagreed])))
+        lookahead_results, student_np = await asyncio.gather(
+            asyncio.gather(*[lookahead(t) for t in disagreed]),
+            self._student_not_progress(memory, disagreed, n_total_steps, limited),
+        )
+        lookaheads = dict(zip(disagreed, lookahead_results))
 
         gate_weights: List[float] = []
         for t in range(n_total_steps):
             result = lookaheads.get(t)
             disagree = t in lookaheads
-            weight = lookahead_weight(gate, disagree, result["progress"] if result else None)
+            weight = self._step_weight(gate, disagree, result, student_np.get(t))
             response = turn_responses[t]
             if response.metrics is None:
                 response.metrics = {}
             response.metrics["opd_gate_disagree"] = float(disagree)
             if result is not None:
                 response.metrics["opd_gate_teacher_no_progress"] = float(result["progress"] is False)
+            if t in student_np:
+                response.metrics["opd_gate_not_progress"] = float(student_np[t])
             gate_weights.append(weight)
 
         # ---- Pass 3: teacher logprobs, blend by weight, fill experience. ----
@@ -432,7 +454,7 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
             last["env_done"] = 1.0 if self._env_done else 0.0
             last["kl_divergence"] = sum(per_turn_kl_sums)
             last["opd_gate_apply_rate"] = sum(gate_weights) / n_total_steps
-            full = self.teacher_progress_weight
+            full = self._full_weight()
             last["opd_gate_full_rate"] = sum(w == full for w in gate_weights) / n_total_steps
             last["opd_gate_half_rate"] = sum(0.0 < w < full for w in gate_weights) / n_total_steps
             last["opd_gate_none_rate"] = sum(w == 0.0 for w in gate_weights) / n_total_steps

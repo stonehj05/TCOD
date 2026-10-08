@@ -20,6 +20,11 @@ step 2 is replaced by the teacher playing ahead from every turn it disagreed wit
 its own steps (`teacher_lookahead` of that module). Each look-ahead replays the game, so it
 runs as its own Ray task (one CPU, any node); the weight comes from `lookahead_weight`.
 
+Student + teacher look-ahead (OPD_gated_workflow_student_teacher_lookahead.py, gate_mode
+"student_teacher_lookahead"): for every turn the teacher disagreed with, both step 2 (the
+progress question on the student's own next steps) and the teacher's look-ahead run, at the
+same time; the weight comes from `combined_weight`.
+
 Vanilla OPD (OPD_workflow_fullmemory.py with defer_teacher) has no gate: its turns carry
 gate_mode "always", get no question, and only step 4 runs, storing the teacher's logprobs as
 they are.
@@ -58,6 +63,10 @@ from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_teacher_look
     lookahead_task,
     lookahead_weight,
     teacher_lookahead,
+)
+from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_student_teacher_lookahead import (
+    GATE_MODE as COMBINED_MODE,
+    combined_weight,
 )
 from trinity.utils.log import get_logger
 
@@ -131,7 +140,7 @@ class DeferredTeacherGate:
                     )
                     return responses[0].response_text or ""
 
-                return await teacher_lookahead(ask, args[0], memory, *args[1:])
+                return await teacher_lookahead(ask, args[0], memory[: 2 * payload["step"] + 1], *args[1:])
             if self._lookahead_remote is None:
                 # max_calls=1: a fresh process per look-ahead. Every ALFWorld game leaves a
                 # 35 MB planner library mapped from TMPDIR (tmpfs) until its process exits.
@@ -190,7 +199,8 @@ class DeferredTeacherGate:
         # teacher_lookahead: the teacher plays ahead from the turns it disagreed with.
         ahead = [
             i for i in gated
-            if payloads[i]["gate"]["gate_mode"] == LOOKAHEAD_MODE and agree_answers[i][0] is not True
+            if payloads[i]["gate"]["gate_mode"] in (LOOKAHEAD_MODE, COMBINED_MODE)
+            and agree_answers[i][0] is not True
         ]
         t_ahead = time.time()
         late_answers, ahead_results = await asyncio.gather(
@@ -228,13 +238,22 @@ class DeferredTeacherGate:
                 not_progress = says_progress is not True
             elif not payloads[i]["has_window"]:
                 not_progress = not bool(payloads[i]["final_reward"])
-            weight = gate_weight(payloads[i]["gate"], disagree, not_progress)
+            if payloads[i]["gate"]["gate_mode"] == COMBINED_MODE:
+                result = lookaheads.get(i)
+                weight = combined_weight(
+                    payloads[i]["gate"], disagree, not_progress, result["progress"] if result else None
+                )
+            else:
+                result = None
+                weight = gate_weight(payloads[i]["gate"], disagree, not_progress)
             weights.append(weight)
             n_disagree += disagree
             if exp.metrics is None:
                 exp.metrics = {}
             exp.metrics["opd_gate_disagree"] = float(disagree)
             exp.metrics["opd_gate_weight"] = weight
+            if result is not None:
+                exp.metrics["opd_gate_teacher_no_progress"] = float(result["progress"] is False)
             if not_progress is not None:
                 n_prog_known += 1
                 n_not_progress += not_progress
@@ -281,6 +300,7 @@ class DeferredTeacherGate:
         g_w = [weights[i] for i in gated]
         full = [
             g["teacher_progress_weight"] if g["gate_mode"] == LOOKAHEAD_MODE
+            else g["both_weight"] if g["gate_mode"] == COMBINED_MODE
             else g["single_criterion_weight"] * 2 if g["gate_mode"] == "sum"
             else g["disagree_no_progress_weight"]
             for g in (payloads[i]["gate"] for i in gated)
