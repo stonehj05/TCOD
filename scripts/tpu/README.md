@@ -493,6 +493,37 @@ explore step about 77 s instead of about 450 s; a training step end to end about
 instead of about 8 min (teacher gating + scoring 22-59 s of it); 250 steps extrapolate to
 about 9 h instead of 33.6 h. Other chip layouts were not tried.
 
+### 10.2 Teacher look-ahead gate (`OPD_gated_alfworld_workflow_teacher_lookahead`)
+
+The disagreement gate with the look-ahead done by the teacher instead of the student. Where
+the teacher disagrees with the student's action, the game is replayed up to that step and the
+teacher itself plays the next `progress_window_size` (5) steps, starting with its own action;
+it is then asked whether those steps make progress.
+
+| Teacher's answer for a step | OPD weight |
+|---|---|
+| agrees with the student's action | 0 |
+| disagrees, its own steps make progress (or it completes the task) | `teacher_progress_weight` (1.0) |
+| disagrees, its own steps make no progress | `teacher_no_progress_weight` (0.5) |
+
+An unparseable progress answer or a failed look-ahead keeps the full weight. Config:
+`opd_gated_disagree_teacher_lookahead_deferred_tpu.yaml`; workflow arguments
+`teacher_rollout_temperature` (0.0) and `teacher_rollout_max_tokens` (512) set how the
+teacher's own steps are decoded.
+
+- Works with and without `defer_teacher`. With it, the trainer starts one Ray task per
+  disagreed turn of the batch (one CPU each, on any worker); the task replays the game and
+  calls a teacher engine by actor name. The game files must therefore be at the same path on
+  every worker, and the tasks get `explorer.env_vars` (`TMPDIR` on tmpfs).
+- Cost per disagreed turn: one game replay (about 3 s to create the game, 0.13 s per
+  replayed step) and up to `progress_window_size` + 1 teacher generations.
+- Metrics per training step (`teacher_gate/teacher_lookahead_*`): `count`, `errors`,
+  `no_progress_rate`, `finished_rate`, `same_first_action_rate` (the teacher's first step
+  equals the action it said it would not choose), `replay_ok_rate` (the replayed observation
+  equals the one the student saw; should be 1), and `time/teacher_gate_lookahead`.
+- Test: `python tests/workflow/test_opd_gated_teacher_lookahead.py --ray` (scripted student
+  and teacher on a real ALFWorld game; no TPU).
+
 ## 11. Known issues and gotchas
 
 Environment
@@ -551,6 +582,7 @@ Operating
 | `trinity/trainer/tunix/teacher_gate.py` | `defer_teacher`: teacher gating and scoring of the sampled turns in the trainer (10.1) |
 | `trinity/manager/synchronizer.py` | publishes sync checkpoints (`_find_tunix_latest_state_dict`), cleanup |
 | `trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_agree_lookahead.py` | combined agreement + look-ahead gate with batched teacher calls |
+| `trinity/common/workflows/envs/TCOD/alfworld/OPD_gated_workflow_teacher_lookahead.py` | disagreement gate with the teacher's own look-ahead (10.2) |
 | `TCOD_examples/alfworld/*_tpu*.yaml` | TPU configs |
 | `scripts/tpu/setup_node.sh`, `requirements-tpu.txt`, `tpu_inference_rpa_v3_tpu_v4.patch` | per-VM environment |
 | `scripts/tpu/start_cluster.sh` | NFS shares, teacher weights, Ray cluster with role labels |
