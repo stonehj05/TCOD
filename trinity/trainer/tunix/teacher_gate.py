@@ -15,6 +15,11 @@ for an episode, with the workflow module's own prompt builders, parser and weigh
   4. teacher logprobs of the student's tokens, blended toward the student's own by the weight
      and stored as `teacher_logprobs`, exactly as the workflow stores them.
 
+Teacher look-ahead (OPD_gated_workflow_teacher_lookahead.py, gate_mode "teacher_lookahead"):
+step 2 is replaced by the teacher playing ahead from every turn it disagreed with and judging
+its own steps (`teacher_lookahead` of that module). Each look-ahead replays the game, so it
+runs as its own Ray task (one CPU, any node); the weight comes from `lookahead_weight`.
+
 Vanilla OPD (OPD_workflow_fullmemory.py with defer_teacher) has no gate: its turns carry
 gate_mode "always", get no question, and only step 4 runs, storing the teacher's logprobs as
 they are.
@@ -26,6 +31,9 @@ they are reached by their Ray actor names. Settings, all in the taskset's workfl
                                     Their blended teacher logprobs equal the student's own
                                     whatever the teacher says, so training is unchanged;
                                     only the raw-KL diagnostic then covers fewer turns.
+  trainer_lookahead_in_process      run teacher look-aheads inside the trainer process, one
+                                    game replay after another, instead of as Ray tasks
+                                    (default false; for tests and debugging)
 """
 
 import asyncio
@@ -44,6 +52,13 @@ from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_agree_lookah
     payload_memory,
     progress_messages,
 )
+from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_teacher_lookahead import (
+    GATE_MODE as LOOKAHEAD_MODE,
+    lookahead_metrics,
+    lookahead_task,
+    lookahead_weight,
+    teacher_lookahead,
+)
 from trinity.utils.log import get_logger
 
 PAYLOAD_KEY = "opd_deferred"
@@ -61,6 +76,11 @@ class DeferredTeacherGate:
         self.enabled = bool(args.get("defer_teacher", False))
         self.parallel = max(1, int(args.get("trainer_teacher_parallel_prompts", DEFAULT_PARALLEL_PER_TEACHER)))
         self.skip_zero_weight_scoring = bool(args.get("skip_zero_weight_scoring", False))
+        self.lookahead_in_process = bool(args.get("trainer_lookahead_in_process", False))
+        # Look-ahead tasks replay ALFWorld games: give them the workflow runners' environment
+        # (TMPDIR on tmpfs, see the training configs).
+        self._task_env = dict(getattr(config.explorer, "env_vars", None) or {})
+        self._lookahead_remote = None
         aux = config.explorer.auxiliary_models
         self.teacher_names = [
             f"{config.explorer.name}_auxiliary_model_0_{j}" for j in range(aux[0].engine_num)
@@ -98,6 +118,33 @@ class DeferredTeacherGate:
         )
         text = responses[0].response_text or ""
         return parse_yes_no(text), text
+
+    async def _lookahead(self, k: int, payload: Dict, memory: List[Dict[str, str]]) -> Optional[Dict]:
+        """Teacher look-ahead for one disagreed turn; None if it failed (the turn then keeps
+        the full weight)."""
+        args = (payload["game_file"], payload["prior_actions"], payload["step"], payload["gate"], payload["action"])
+        try:
+            if self.lookahead_in_process:
+                async def ask(messages, temperature, max_tokens):
+                    responses = await self._call(
+                        "chat", messages, lora_request=None, temperature=temperature, max_tokens=max_tokens, n=1
+                    )
+                    return responses[0].response_text or ""
+
+                return await teacher_lookahead(ask, args[0], memory, *args[1:])
+            if self._lookahead_remote is None:
+                # max_calls=1: a fresh process per look-ahead. Every ALFWorld game leaves a
+                # 35 MB planner library mapped from TMPDIR (tmpfs) until its process exits.
+                self._lookahead_remote = ray.remote(
+                    num_cpus=1, max_calls=1, runtime_env={"env_vars": self._task_env}
+                )(lookahead_task)
+            return await self._lookahead_remote.remote(
+                self.teacher_names[k % len(self.teacher_names)], self.namespace,
+                args[0], payload["memory_z"], *args[1:],
+            )
+        except Exception as e:
+            self.logger.warning(f"teacher look-ahead failed (step {payload['step']} of {payload['game_file']}): {e!r}")
+            return None
 
     async def annotate(self, exps: List[Experience]) -> Dict[str, float]:
         """Gate and score the deferred turns of a sampled batch in place; returns metrics."""
@@ -140,7 +187,19 @@ class DeferredTeacherGate:
             i for i in windowed
             if payloads[i]["gate"]["gate_mode"] != "sum" and agree_answers[i][0] is not True
         ]
-        progress_answers.update(zip(late, await asyncio.gather(*[ask_progress(i) for i in late])))
+        # teacher_lookahead: the teacher plays ahead from the turns it disagreed with.
+        ahead = [
+            i for i in gated
+            if payloads[i]["gate"]["gate_mode"] == LOOKAHEAD_MODE and agree_answers[i][0] is not True
+        ]
+        t_ahead = time.time()
+        late_answers, ahead_results = await asyncio.gather(
+            asyncio.gather(*[ask_progress(i) for i in late]),
+            asyncio.gather(*[self._lookahead(k, payloads[i], memories[i]) for k, i in enumerate(ahead)]),
+        )
+        t_ahead = time.time() - t_ahead
+        progress_answers.update(zip(late, late_answers))
+        lookaheads = dict(zip(ahead, ahead_results))
 
         weights, n_disagree, n_agree_bad, n_prog_bad, n_not_progress, n_prog_known = [], 0, 0, 0, 0, 0
         for i, exp in enumerate(turns):
@@ -150,6 +209,18 @@ class DeferredTeacherGate:
             agrees = agree_answers[i][0]
             n_agree_bad += agrees is None
             disagree = agrees is not True  # "No" or unparseable (fail-safe)
+            if payloads[i]["gate"]["gate_mode"] == LOOKAHEAD_MODE:
+                result = lookaheads.get(i)
+                weight = lookahead_weight(payloads[i]["gate"], disagree, result["progress"] if result else None)
+                weights.append(weight)
+                n_disagree += disagree
+                if exp.metrics is None:
+                    exp.metrics = {}
+                exp.metrics["opd_gate_disagree"] = float(disagree)
+                exp.metrics["opd_gate_weight"] = weight
+                if result is not None:
+                    exp.metrics["opd_gate_teacher_no_progress"] = float(result["progress"] is False)
+                continue
             not_progress = None
             if i in progress_answers:
                 says_progress = progress_answers[i][0]
@@ -209,7 +280,9 @@ class DeferredTeacherGate:
         g_n = len(gated)
         g_w = [weights[i] for i in gated]
         full = [
-            g["single_criterion_weight"] * 2 if g["gate_mode"] == "sum" else g["disagree_no_progress_weight"]
+            g["teacher_progress_weight"] if g["gate_mode"] == LOOKAHEAD_MODE
+            else g["single_criterion_weight"] * 2 if g["gate_mode"] == "sum"
+            else g["disagree_no_progress_weight"]
             for g in (payloads[i]["gate"] for i in gated)
         ]
         metrics.update({
@@ -226,4 +299,7 @@ class DeferredTeacherGate:
             metrics["teacher_gate/opd_gate_not_progress_rate"] = n_not_progress / n_prog_known
         if progress_answers:
             metrics["teacher_gate/progress_parse_success_rate"] = 1.0 - n_prog_bad / len(progress_answers)
+        if lookaheads:
+            metrics["time/teacher_gate_lookahead"] = t_ahead
+            metrics.update(lookahead_metrics(list(lookaheads.values()), "teacher_gate/teacher_lookahead_"))
         return metrics

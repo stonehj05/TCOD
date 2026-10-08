@@ -64,6 +64,7 @@ WORKFLOWS: Registry = Registry(
         "OPD_gated_alfworld_workflow_lookahead": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_lookahead.OPDGatedAlfworldWorkflowLookahead",
         "OPD_gated_alfworld_workflow_lookahead_soft": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_lookahead_soft.OPDGatedAlfworldWorkflowLookaheadSoft",
         "OPD_gated_alfworld_workflow_agree_lookahead": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_agree_lookahead.OPDGatedAlfworldWorkflowAgreeLookahead",
+        "OPD_gated_alfworld_workflow_teacher_lookahead": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_teacher_lookahead.OPDGatedAlfworldWorkflowTeacherLookahead",
         "TCOD_f2b_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_f2b_workflow.TCOD_f2b_alfworld_workflow",
         "TCOD_b2f_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow.TCOD_b2f_alfworld_workflow",
         "OPD_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",
