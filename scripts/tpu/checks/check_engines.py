@@ -45,6 +45,24 @@ def main(config_path: str, plan_only: bool) -> None:
         lp = ray.get(tch.logprobs.remote(e.tokens.tolist(), temperature=1.0))[e.prompt_length - 1:]
         assert len(lp) == n_resp, f"teacher returned {len(lp)} response logprobs, expected {n_resp}"
         print(f"TEACHER{i} scoring ({time.time() - t:.1f}s): {len(lp)} logprobs, mean {float(lp.mean()):.3f}", flush=True)
+    # Student scoring (FutureBridge-OPD: the student also scores the teacher's bridge turn and its
+    # own continuations). Short sequence, then one at the full training length, which is where
+    # a 1-chip engine could run out of memory.
+    if "--student-scoring" in sys.argv:
+        t = time.time()
+        lp = ray.get(students[0].logprobs.remote(e.tokens.tolist(), temperature=1.0))[e.prompt_length - 1:]
+        assert len(lp) == n_resp, f"student returned {len(lp)} response logprobs, expected {n_resp}"
+        gap = float((lp - e.logprobs).abs().max())
+        print(f"STUDENT scoring ({time.time() - t:.1f}s): {len(lp)} logprobs, max |scored - sampled| {gap:.3f}", flush=True)
+        n_long = cfg.model.max_prompt_tokens + cfg.model.max_response_tokens
+        long_tokens = (e.tokens.tolist() * (n_long // len(e.tokens) + 1))[:n_long]
+        t = time.time()
+        lp = ray.get(students[0].logprobs.remote(long_tokens, temperature=1.0))
+        print(f"STUDENT scoring at full length ({time.time() - t:.1f}s): {len(lp)} logprobs for {n_long} tokens", flush=True)
+        for i, tch in enumerate(teachers):
+            t = time.time()
+            lp = ray.get(tch.logprobs.remote(long_tokens, temperature=1.0))
+            print(f"TEACHER{i} scoring at full length ({time.time() - t:.1f}s): {len(lp)} logprobs", flush=True)
     # In-place weight reload (what happens after every training step), using the base weights.
     from trinity.trainer.tunix.hf_io import resolve_model_dir
 

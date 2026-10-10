@@ -9,7 +9,8 @@
 # OPD weight of a disagreed step, with S = student NOT making progress, T = teacher making progress:
 #   S and T      -> both_weight    (1.0)
 #   exactly one  -> one_weight     (0.5)
-#   neither      -> neither_weight (0.0)
+#   neither      -> neither_weight (0.2 in this config: a disagreed step always gets some OPD;
+#                                     opd_gated_student_teacher_lookahead_deferred_tpu.yaml uses 0.0)
 # A step the teacher agrees with gets 0. Unknown answers never lower the weight: an unparseable
 # (B) counts as S, an unparseable (C) or a failed look-ahead counts as T.
 # Compare opd_gated_disagree_lookahead_deferred_tpu.yaml (B only) and
@@ -26,10 +27,10 @@
 #   WORKER_ROLES="trainer teacher teacher explorer" TEACHER_MODEL=Qwen/Qwen3-30B-A3B \
 #     bash ~/TCOD/scripts/tpu/start_cluster.sh
 #   cd ~/TCOD && PATH=$HOME/venv-vllm-tpu/bin:$PATH setsid nohup \
-#     trinity run --config TCOD_examples/alfworld/opd_gated_student_teacher_lookahead_deferred_tpu.yaml > ~/train.log 2>&1 < /dev/null &
+#     trinity run --config TCOD_examples/alfworld/opd_gated_student_teacher_lookahead_w02_deferred_tpu.yaml > ~/train.log 2>&1 < /dev/null &
 # See scripts/tpu/README.md.
 project: "ALFWORLD_TCOD"
-name: "alfworld_opd_gated_student_teacher_lookahead_deferred_tpu"
+name: "alfworld_opd_gated_student_teacher_lookahead_w02_deferred_tpu"
 checkpoint_root_dir: ./checkpoints
 continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for steps 150-250) is used
 
@@ -94,7 +95,7 @@ buffer:
         # S = student not making progress, T = teacher making progress (see header)
         both_weight: 1.0
         one_weight: 0.5
-        neither_weight: 0.0
+        neither_weight: 0.2  # the only change from opd_gated_student_teacher_lookahead_deferred_tpu.yaml
         # The trainer gates and scores the turns it samples; the explorer makes no teacher call.
         defer_teacher: true
         trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
@@ -103,9 +104,9 @@ buffer:
     default_workflow_type: 'OPD_gated_alfworld_workflow_student_teacher_lookahead'
   trainer_input:
     experience_buffer:
-      name: alfworld_opd_gated_student_teacher_lookahead_deferred_tpu_buffer
+      name: alfworld_opd_gated_student_teacher_lookahead_w02_deferred_tpu_buffer
       storage_type: queue
-      path: 'sqlite:///alfworld_opd_gated_student_teacher_lookahead_deferred_tpu_buffer.db'
+      path: 'sqlite:///alfworld_opd_gated_student_teacher_lookahead_w02_deferred_tpu_buffer.db'
 
 explorer:
   eval_interval: 5

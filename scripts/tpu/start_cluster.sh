@@ -89,6 +89,25 @@ if [ -n "$TEACHER_MODEL" ]; then
     done
 fi
 
+# 3b. Host firewall: Ray has no authentication, and its ports listen on every interface. On a
+# VM with a public address anyone who can reach them can run code on the whole cluster (a
+# crypto miner was installed here that way, 2026-10-02). Accept inbound TCP only from the
+# workers themselves and loopback, plus SSH; needs passwordless sudo. Not persistent across
+# reboots, which is fine: this script runs after every reboot. Set TCOD_NO_FIREWALL=1 to skip.
+if [ -z "${TCOD_NO_FIREWALL:-}" ]; then
+    guard="sudo -n true 2>/dev/null || { echo \"\$(hostname): no passwordless sudo, Ray ports NOT firewalled\" >&2; exit 0; }
+        sudo iptables -N TCOD_GUARD 2>/dev/null || sudo iptables -F TCOD_GUARD
+        sudo iptables -A TCOD_GUARD -i lo -j RETURN
+        sudo iptables -A TCOD_GUARD -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+        for ip in ${IPS[*]}; do sudo iptables -A TCOD_GUARD -s \$ip -j RETURN; done
+        sudo iptables -A TCOD_GUARD -p tcp --dport 22 -j RETURN
+        sudo iptables -A TCOD_GUARD -p tcp -j DROP
+        sudo iptables -C INPUT -j TCOD_GUARD 2>/dev/null || sudo iptables -I INPUT 1 -j TCOD_GUARD"
+    bash -c "$guard"
+    for ip in "${OTHERS[@]}"; do $SSH "$ip" "$guard"; done
+    echo "host firewall: inbound TCP limited to ${IPS[*]} and SSH"
+fi
+
 # 4. Ray cluster (label = <role>_tpu, sized to the worker's chip count)
 RAY=$VENV/bin/ray
 chips() { if [ "$1" = 0 ]; then ls /dev/accel* 2>/dev/null | wc -l; else $SSH "${IPS[$1]}" 'ls /dev/accel* 2>/dev/null | wc -l'; fi; }
