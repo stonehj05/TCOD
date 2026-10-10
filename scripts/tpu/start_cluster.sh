@@ -108,6 +108,12 @@ if [ -z "${TCOD_NO_FIREWALL:-}" ]; then
     echo "host firewall: inbound TCP limited to ${IPS[*]} and SSH"
 fi
 
+# 3c. Node-local tmpfs folder for the trainer-input buffer copy (configs point
+# trainer_input.experience_buffer.path at it). A relative sqlite path lands in the home
+# directory of whichever worker hosts the queue actor and can fill that worker's disk.
+mkdir -p /dev/shm/tcod_buffers
+for ip in "${OTHERS[@]}"; do $SSH "$ip" 'mkdir -p /dev/shm/tcod_buffers'; done
+
 # 4. Ray cluster (label = <role>_tpu, sized to the worker's chip count)
 RAY=$VENV/bin/ray
 chips() { if [ "$1" = 0 ]; then ls /dev/accel* 2>/dev/null | wc -l; else $SSH "${IPS[$1]}" 'ls /dev/accel* 2>/dev/null | wc -l'; fi; }

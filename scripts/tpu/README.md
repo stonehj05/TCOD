@@ -22,6 +22,8 @@ Contents
 
 ---
 
+Results of every evaluated checkpoint and the settings of each training run: `experiments/README.md`.
+
 ## 1. What this is
 
 TCOD trains with Trinity-RFT: an *explorer* plays ALFWorld games with a student model served
@@ -525,6 +527,21 @@ teacher's own steps are decoded.
   and teacher on a real ALFWorld game; no TPU).
 
 ## 11. Known issues and gotchas
+
+- **Hidden second copy of the experience buffer.** With a relative
+  `trainer_input.experience_buffer.path` (`sqlite:///name.db`), Trinity's queue actor writes
+  a second copy of the buffer into the home directory of whichever worker hosts it, several
+  GB per run. They accumulate silently and filled a worker's disk mid-run. Use an absolute
+  path on node-local tmpfs, `sqlite:////dev/shm/tcod_buffers/<name>.db` (the folder is
+  created by `start_cluster.sh`), as `ftb_qwen3_30b_to_4b_tpu.yaml` does, and delete old
+  `~/*_buffer.db` files.
+- **Ray is unauthenticated.** Its ports listen on all interfaces; on VMs with public
+  addresses and a permissive project firewall, a crypto miner was installed through it.
+  `start_cluster.sh` now adds a host firewall limiting inbound TCP to the workers and SSH.
+- **tmpfs fills during long runs.** Besides the sync checkpoints and the resume state,
+  engines on other workers keep superseded sync checkpoints open over NFS, so their space is
+  only returned when the run exits (about 50 GB over a 10-hour deferred run). Leave that
+  much headroom on worker 0's tmpfs.
 
 Environment
 

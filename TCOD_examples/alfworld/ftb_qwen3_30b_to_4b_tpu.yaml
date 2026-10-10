@@ -101,7 +101,10 @@ buffer:
     experience_buffer:
       name: alfworld_ftb_qwen3_30b_to_4b_tpu_buffer
       storage_type: queue
-      path: 'sqlite:///alfworld_ftb_qwen3_30b_to_4b_tpu_buffer.db'
+      # Absolute path on node-local tmpfs (the dir must exist on every worker). A relative path is
+      # created in the home directory of whichever worker hosts the queue actor and silently
+      # fills that worker's disk (this stopped the first attempt at step 37).
+      path: 'sqlite:////dev/shm/tcod_buffers/alfworld_ftb_qwen3_30b_to_4b_tpu_buffer.db'
 
 explorer:
   eval_interval: 5
