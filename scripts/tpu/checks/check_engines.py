@@ -54,7 +54,7 @@ def main(config_path: str, plan_only: bool) -> None:
         assert len(lp) == n_resp, f"student returned {len(lp)} response logprobs, expected {n_resp}"
         gap = float((lp - e.logprobs).abs().max())
         print(f"STUDENT scoring ({time.time() - t:.1f}s): {len(lp)} logprobs, max |scored - sampled| {gap:.3f}", flush=True)
-        n_long = cfg.model.max_prompt_tokens + cfg.model.max_response_tokens
+        n_long = cfg.model.max_prompt_tokens + cfg.model.max_response_tokens - 1  # the engine's limit is max_model_len - 1
         long_tokens = (e.tokens.tolist() * (n_long // len(e.tokens) + 1))[:n_long]
         t = time.time()
         lp = ray.get(students[0].logprobs.remote(long_tokens, temperature=1.0))

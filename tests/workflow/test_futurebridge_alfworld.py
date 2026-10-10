@@ -32,7 +32,7 @@ class RolloutArgs:
 
 
 def admissible(user_content):
-    block = user_content.split("admissible actions of the current situation are:\n[", 1)[1].split("].\n", 1)[0]
+    block = re.split(r"admissible actions of the current situation are:\s*\[", user_content, 1)[1].split("].\n", 1)[0]
     return re.findall(r"'([^']*)'", block)
 
 

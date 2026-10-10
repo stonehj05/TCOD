@@ -9,7 +9,13 @@ Changes from the release are marked "TPU port:" below:
      The release reads it in `_try_kl_bridges` but never sets it, so the validation replay
      restarted from the beginning of the game and then applied the Student's actions, which
      only reproduces the Student's states once the curriculum prefix is 0.
+     The release's sanitizer replaced whole lines by "# (implementation detail)" where a line
+     carried a non-English comment (e.g. `b_idx = exp.eid.step - 5000` is missing in
+     _FutureBridgeGateAlfworldBase but present in its sibling class), and such a placeholder
+     sits exactly where this assignment belongs, so this most likely restores the authors' code.
   2. `continuation_steps` is read from workflow_args (default 3, the release's constant).
+  3. Prompt templates and parse_action come from ftb_release_utils.py, an unchanged copy of
+     the release's utils.py (this repo's utils.py has different templates).
 Note: the release's ALFWorld configs list bridge_position_top_k / bridge_max_per_ep /
 bridge_failed_episodes_only / bridge_require_full_continuation, but this ALFWorld workflow
 does not read them. What the code does: one bridge per episode (bridge_kl_max_per_ep, 1) at the
@@ -37,7 +43,7 @@ from trinity.common.workflows import Task
 from trinity.common.workflows.envs.TCOD.alfworld.Bridge_TCOD_kl_workflow import (
     Bridge_TCOD_kl_alfworld_workflow,
 )
-from trinity.common.workflows.envs.TCOD.alfworld.utils import (
+from trinity.common.workflows.envs.TCOD.alfworld.ftb_release_utils import (
     ALFWORLD_TEMPLATE,
     ALFWORLD_TEMPLATE_NO_HIS,
     HISTORY_LENGTH,

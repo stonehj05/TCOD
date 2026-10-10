@@ -41,7 +41,7 @@ from trinity.common.workflows import WORKFLOWS, Task
 from trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow import (
     TCOD_b2f_alfworld_workflow,
 )
-from trinity.common.workflows.envs.TCOD.alfworld.utils import (
+from trinity.common.workflows.envs.TCOD.alfworld.ftb_release_utils import (
     ALFWORLD_TEMPLATE,
     ALFWORLD_TEMPLATE_NO_HIS,
     HISTORY_LENGTH,
@@ -95,7 +95,7 @@ class Bridge_TCOD_kl_alfworld_workflow(TCOD_b2f_alfworld_workflow):
         _run_episode_from_checkpoint so KL bridge fires throughout training.
         """
         import re as _re
-        from trinity.common.workflows.envs.TCOD.alfworld.utils import _create_alfworld_env_with_checkpoint
+        from trinity.common.workflows.envs.TCOD.alfworld.ftb_release_utils import _create_alfworld_env_with_checkpoint
 
         if self.is_eval:
             # Eval: pure student, no bridge, no teacher prefix

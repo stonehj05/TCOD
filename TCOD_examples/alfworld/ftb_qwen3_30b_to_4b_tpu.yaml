@@ -13,11 +13,13 @@
 #      share of continuation tokens the Teacher prefers (teacher logprob > student logprob) is
 #      higher than on the Student's original next 3 turns.
 #
-# Kept from the release: curriculum (linear, checkpoint_steps 5), one bridge per episode,
-# 3 continuation turns, Teacher prompt limit 10240 (so bridge turns fit the trainer), lr, loss.
-# Ours instead of the release's: models; the repo's ALFWorld prompt template (the release uses
-# TCOD's original template with mandatory <think> tags; ours matches the eval client); 250
-# training steps with a checkpoint every 50 (release: 200 steps); 8 runners per engine.
+# As in the release (configs/alfworld/ftb_qwen3_32b_to_4b.yaml and the code's defaults):
+# prompt templates (TCOD's original, with mandatory <think> tags: ftb_release_utils.py),
+# curriculum (linear, checkpoint_steps 5), bridge settings, 200 training steps, 6 runners per
+# engine, Teacher prompt limit 10240, lr, loss, thinking mode off.
+# Not as in the release: the Teacher model (ours); the TPU backends and engine layout; a
+# checkpoint every 50 steps instead of every 10 (20 checkpoints of 8.3 GB do not fit here).
+# NOTE for evaluation: scripts/tpu/eval uses this repo's prompt template, not the release's.
 # Needs the expert trajectories: ~/alf-data/tcod_tasks/train_expert.jsonl on every worker
 # (the release's train_expert.jsonl with game_file paths remapped; same 3553 games and order as
 # train.jsonl, 121 of them without expert actions).
@@ -37,7 +39,7 @@
 project: "ALFWORLD_TCOD"
 name: "alfworld_ftb_qwen3_30b_to_4b_tpu"
 checkpoint_root_dir: ./checkpoints
-continue_from_checkpoint: false  # TPU: set true to resume from the latest full checkpoint
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for steps 150-200) is used
 
 algorithm:
   sample_strategy: staleness_control
@@ -62,7 +64,7 @@ cluster:
   gpu_per_node: 4
 
 buffer:
-  total_steps: 300  # explorer steps: > trainer.total_steps so the run ends on exactly 250 training steps
+  total_steps: 300  # explorer steps: > trainer.total_steps so the run ends on exactly 200 training steps
   # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
   # opd_gated_disagree_lookahead_tpu.yaml uses 8).
   batch_size: 16
@@ -83,19 +85,17 @@ buffer:
         temperature: 1.0
         max_env_steps: 30
         # Back-to-front curriculum, as in the release's 4B config
-        total_steps: 250
+        total_steps: 200
         checkpoint_strategy: linear
         checkpoint_steps: 5
-        # Bridge: what the ALFWorld workflow actually reads (the release's ALFWorld configs list
-        # bridge_position_top_k / bridge_max_per_ep / bridge_failed_episodes_only /
-        # bridge_require_full_continuation, which this workflow ignores; these give the same
-        # "one bridge at the top-disagreement turn, 3-turn continuation" behaviour)
-        # 0.01 = try only the single most-disagreed turn of an episode, the paper's
-        # bridge_position_top_k: 1. (The code default 0.3 also tries the next turns, up to 30% of
-        # the episode, whenever a candidate is rejected.)
-        bridge_kl_top_ratio: 0.01
-        bridge_kl_max_per_ep: 1
+        # The release's keys, verbatim. Its ALFWorld workflow does not read them; it uses its
+        # defaults bridge_kl_top_ratio 0.3 (turns tried, most-disagreed first, until one bridge is
+        # kept), bridge_kl_max_per_ep 1 and 3 continuation turns, and bridges failed episodes only.
+        bridge_position_top_k: 1
+        bridge_max_per_ep: 1
         continuation_steps: 3
+        bridge_failed_episodes_only: false
+        bridge_require_full_continuation: true
     default_workflow_type: 'FutureBridgeAlfworldWorkflow'
   trainer_input:
     experience_buffer:
@@ -105,7 +105,7 @@ buffer:
 
 explorer:
   eval_interval: 5
-  runner_per_model: 8
+  runner_per_model: 6  # as in the release
   max_timeout: 3600
   rollout_model:
     # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
@@ -146,7 +146,7 @@ synchronizer:
 
 trainer:
   trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
-  total_steps: 250
+  total_steps: 200  # as in the release
   save_interval: 50  # TPU: disk on worker 0 (see header); GPU run: 25
   grad_clip: 1.0
   sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
