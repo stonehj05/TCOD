@@ -1,0 +1,165 @@
+# Gated OPD on ScienceWorld: the method of our best ALFWorld run,
+# TCOD_examples/alfworld/opd_gated_student_teacher_lookahead_t07_s03_deferred_tpu.yaml
+# (disagreement + student look-ahead + teacher look-ahead; weights 1.0 / 0.7 / 0.3 / 0.0;
+# see that file's header), with the game swapped. Every value is that run's except the game:
+#   - taskset: TCOD's ScienceWorld data (TCOD_examples/scienceworld/get_sciworld_data.py, unchanged
+#     split: 17 train task types x 50% of their variations = 2294 games), at ~/sci-data/tcod_tasks
+#     on every worker; prompt_key task_desc (a JSON game spec: task_name, var_num, jar_path);
+#   - workflow: OPD_gated_scienceworld_workflow_student_teacher_lookahead (TCOD's ScienceWorld rollout with
+#     DASH-OPD's prompts, arXiv 2607.29078 Appendix L: no history summary in turns 1-3, the last 2
+#     observation-action pairs from turn 4, full conversation; reward = score / 100; "completed" = score 100
+#     for the gate's outcome checks). The same prompts in the teacher's look-ahead and in eval. The first run
+#     of this config (..._t07_s03_deferred_tpu, TCOD's ScienceWorld prompts) was deleted on 2026-10-16.
+#     Training metrics per explore step: rollout/env_score/mean (mean best score / 100) and
+#     rollout/env_success/mean (share of games completed). rollout/env_done is NOT the success rate
+#     here: ScienceWorld also ends a game on a failing move.
+# The training hyperparameters are also TCOD's ScienceWorld ones (TCOD_examples/scienceworld/opd.yaml and
+# tcod_b2f.yaml use the same values as their ALFWorld configs): lr 1e-6, batch 16 games / 64 turns,
+# staleness 2, kl_coef 1, 30 game steps, 10240 / 512 tokens, temperature 1.0, 250 steps.
+# Not as TCOD's ScienceWorld configs: the Student / Teacher (ours: plain Qwen3-4B / Qwen3-30B-A3B; TCOD:
+# Qwen2.5-3B-Instruct / unspecified), the TPU layout, a checkpoint every 50 steps, and no in-training
+# eval (TCOD: 10 random test games every 5 steps). Evaluate afterwards instead, as our ALFWorld runs:
+#   bash scripts/tpu/eval/eval_all_sciworld_checkpoints.sh checkpoints/SCIENCEWORLD_TCOD/<name> <label>
+# = avg@4 on all 1308 test games (TCOD's split; the paper's "test split from training data"), temperature
+# 0.4, 30 game steps, max_tokens 4096; reports success rate (the paper's Table 3 metric) and mean score.
+# A game whose conversation outgrows the 40960-token context ends there with its best score so far.
+#
+# Needs on EVERY worker (done 2026-10-14): Java 17 (openjdk-17-jre-headless), the scienceworld
+# package 1.2.3 in ~/venv-vllm-tpu (its scienceworld.jar is the jar_path in the task files), and
+# ~/sci-data/tcod_tasks/. Teacher look-aheads replay games in Ray tasks on any worker.
+#
+# TPU layout and launch as the ALFWorld run:
+#   WORKER_ROLES="trainer teacher teacher explorer" TEACHER_MODEL=Qwen/Qwen3-30B-A3B \
+#     bash ~/TCOD/scripts/tpu/start_cluster.sh
+#   cd ~/TCOD && PATH=$HOME/venv-vllm-tpu/bin:$PATH setsid nohup \
+#     trinity run --config TCOD_examples/scienceworld/opd_gated_student_teacher_lookahead_t07_s03_deferred_tpu.yaml > ~/train.log 2>&1 < /dev/null &
+# See scripts/tpu/README.md.
+project: "SCIENCEWORLD_TCOD"
+name: "scienceworld_opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for steps 150-250) is used
+
+# Mechanism: trinity/common/workflows/envs/TCOD/scienceworld/OPD_gated_workflow_student_teacher_lookahead.py
+# Same plain Qwen3-4B student / plain Qwen3-30B-A3B teacher / full-memory setup as the ALFWorld runs.
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B, as our ALFWorld runs (TCOD's ScienceWorld opd.yaml: Qwen2.5-3B-Instruct).
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (see header); the run ends on trainer.total_steps
+  # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
+  # opd_gated_disagree_lookahead_tpu.yaml uses 8).
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: sciworld
+      storage_type: file
+      path: /home/haojun_shi/sci-data/tcod_tasks/train.jsonl  # TCOD's get_sciworld_data.py split (2294 games, 17 task types); on every worker
+      split: train
+      format:
+        prompt_key: 'task_desc'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0  # as TCOD's ScienceWorld configs (the workflow default)
+        max_env_steps: 30
+        # Teacher look-ahead: how many steps the teacher plays from a step it disagrees with,
+        # and how it decodes them.
+        progress_window_size: 5
+        teacher_rollout_temperature: 0.0
+        teacher_rollout_max_tokens: 512
+        # Decoding for the progress judgment of the teacher's own steps.
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        # Decoding for the agreement (yes/no) check -- same as opd_gated_fullmemory.yaml.
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+        # Weight of a step the teacher disagrees with, by its judgment of its own steps.
+        # S = student not making progress, T = teacher making progress (see header)
+        both_weight: 1.0
+        teacher_only_weight: 0.7
+        student_only_weight: 0.3
+        neither_weight: 0.0
+        # The trainer gates and scores the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+        # true: do not score turns whose weight is 0 (training is identical; see teacher_gate.py)
+        skip_zero_weight_scoring: false
+    default_workflow_type: 'OPD_gated_scienceworld_workflow_student_teacher_lookahead'
+  trainer_input:
+    experience_buffer:
+      name: scienceworld_opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:////dev/shm/tcod_buffers/scienceworld_opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu_buffer.db'  # node-local tmpfs: keeps the queue's second copy out of a home directory
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B, as our ALFWorld runs (TCOD's opd.yaml: /path/to/teacher). Called once per turn for logprobs scoring,
+    # plus once per windowed gate decision (~N-5 calls per trajectory).
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4 (fits; 321k-token KV cache)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250
+  save_interval: 50  # TPU: disk on worker 0 (see header); GPU run: 25
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

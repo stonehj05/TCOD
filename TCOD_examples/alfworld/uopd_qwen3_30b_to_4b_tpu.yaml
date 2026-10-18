@@ -1,0 +1,168 @@
+# UOPD, "Uncertainty-Aware Intervention for On-Policy Distillation of Multi-Turn Agents"
+# (https://github.com/onepounchman/UOPD, commit 61f90c5), with OUR student / teacher: plain Qwen3-4B /
+# plain Qwen3-30B-A3B (the release uses Qwen2.5-3B/1.5B-Instruct and a GiGPO Qwen2.5-7B teacher).
+# Workflow: trinity/common/workflows/envs/UOPD/ (copied from the release). The only change: the registry
+# names of its OPD base and eval workflows, UOPD_OPD_alfworld_workflow / UOPD_eval_alfworld_workflow,
+# because TCOD already registers OPD_alfworld_workflow. As in the release, each turn's prompt is ONE user
+# message holding the last 2 steps (no full conversation; a full-memory variant was tried and dropped).
+# What it does per training episode:
+#   1. The Student proposes every action; the Teacher scores it (logprobs of the Student's tokens).
+#      Uncertainty = teacher confidence: mean -log p_teacher over the turn's tokens.
+#   2. A turn whose uncertainty is above an adaptive threshold tau is an intervention: the Teacher
+#      writes its own response from the same prompt and THAT action is executed in the game.
+#      tau is the (1 - r) quantile of the last 1000 turns' scores (a shared Ray actor), with the
+#      target rate r decaying linearly from 0.3 to 0.05 over 120 explore steps.
+#   3. Loss (policy_loss_fn uopd, trinity/trainer/tunix/logps.py:uopd_loss): Student turns get the
+#      OPD policy gradient -A * ratio (A = teacher - student logprob, no PPO clipping); intervention
+#      turns get SFT on the Teacher's tokens; one token-mean over both.
+# Each turn's message uses the release's templates unchanged (TCOD's original, with <think> tags;
+# last 2 steps summarised; the with-history template from the 2nd turn on), 30 game steps (release: 50),
+# success = the game's `won` flag. See trinity/common/workflows/envs/UOPD/alfworld/.
+# Evaluate with the same rollout: EVAL_TEMPLATE=uopd EVAL_MAX_TOKENS=512 (30 game steps, the eval default).
+#
+# As in the release (configs/alfworld/3b/uopd.yaml): every workflow_args value, the task list and
+# its order (~/alf-data/uopd_tasks/alfworld/train.jsonl, written by the release's
+# scripts/prepare_data.py; same 3553 games as ours, different order), random task selection
+# (seed 42), 250 steps, batch 16 / 64 turns, lr 1e-6, kl_coef 1, staleness 2, 8 runners per Student engine.
+# Not as in the release: 30 game steps per episode, as our other runs (release: 50);
+# the Student and Teacher; the TPU backends and engine layout (4 Students
+# x 1 chip, 2 Teachers x 4 chips); prefix caching off (TPU backend); a checkpoint every 50 steps;
+# no in-training eval (evaluate with scripts/tpu/eval afterwards).
+#
+# The Teacher works in the explorer on every turn (defer_teacher does not apply: the Teacher's
+# decision changes which action is executed), so expect the pace of the explorer-side runs or slower
+# (30 game steps per episode, as the other runs).
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Bring-up and launch:
+#   WORKER_ROLES="trainer teacher teacher explorer" TEACHER_MODEL=Qwen/Qwen3-30B-A3B \
+#     bash ~/TCOD/scripts/tpu/start_cluster.sh
+#   cd ~/TCOD && PATH=$HOME/venv-vllm-tpu/bin:$PATH setsid nohup \
+#     trinity run --config TCOD_examples/alfworld/uopd_qwen3_30b_to_4b_tpu.yaml > ~/train.log 2>&1 < /dev/null &
+# See scripts/tpu/README.md.
+project: "ALFWORLD_TCOD"
+name: "alfworld_uopd_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so a pre-created run dir (tmpfs links for steps 150-250) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+    lr_warmup_steps_ratio: 0.0
+  policy_loss_fn: uopd
+  policy_loss_fn_args:
+    loss_agg_mode: token-mean
+    sft_coef: 1.0
+    sft_mode: plain
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as our other runs.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 2048  # as in the release (one message per turn)
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 400  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/uopd_tasks/alfworld/train.jsonl  # release manifest, game_file paths on this VM
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:  # the release's, verbatim except max_env_steps
+        max_env_steps: 30  # as our other runs (release: 50)
+        detect_uq: confidence
+        detect_uq_seed: 0
+        tau: 1.28
+        detect_temperature: 1.0
+        trigger_cap: null
+        sft_warmup_steps: 0
+        cold_start_takeover: false
+        tau_mode: quantile
+        rate_schedule: linear
+        r_start: 0.3
+        r_end: 0.05
+        r_decay_steps: 120
+        window_size: 1000
+        window_n_min: 300
+        teacher_sched: pipeline
+        teacher_takeover: true
+        temperature: 1.0
+      task_selector:
+        selector_type: random
+        seed: 42
+    default_workflow_type: 'UOPD_alfworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_uopd_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      # Absolute path on node-local tmpfs (the dir must exist on every worker); see ftb_qwen3_30b_to_4b_tpu.yaml.
+      path: 'sqlite:////dev/shm/tcod_buffers/alfworld_uopd_qwen3_30b_to_4b_tpu_buffer.db'
+
+explorer:
+  runner_per_model: 8  # as in the release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (release: 2 x tensor_parallel 2 GPUs)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as our other runs. Scores every Student turn
+    # and writes the response on intervention turns.
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (release: 1 x tensor_parallel 2 GPUs)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4 (fits; 321k-token KV cache)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384  # as in the release; single-message prompts stay under ~1k tokens (max 978 over 40 games)
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+  eval_on_startup: false
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250  # as in the release
+  save_interval: 50  # TPU: disk on worker 0; release: 250
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

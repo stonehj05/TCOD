@@ -23,7 +23,7 @@ import optax
 from flax import nnx, struct
 
 from trinity.trainer.tunix import hf_io
-from trinity.trainer.tunix.logps import completion_logps, opd_loss
+from trinity.trainer.tunix.logps import completion_logps, opd_loss, uopd_loss
 
 
 @struct.dataclass
@@ -33,6 +33,7 @@ class _MicroBatch:
     completion_mask: jax.Array
     old_per_token_logps: jax.Array
     advantages: jax.Array
+    triggered: jax.Array  # [B] 1.0 = teacher-executed (UOPD) turn: SFT row; unused by ppo
 
 
 class TunixActorWorker:
@@ -72,6 +73,13 @@ class TunixActorWorker:
             clip_low=cfg["clip_range_low"], clip_high=cfg["clip_range_high"],
             clip_ratio_c=cfg["clip_ratio_c"], loss_agg_mode=cfg["loss_agg_mode"])
         pad_id, eos_id, temperature = self.pad_id, self.eos_id, cfg["temperature"]
+        if cfg.get("policy_loss", "ppo") == "uopd":
+            # UOPDPolicyLossFn (algorithm/policy_loss_fn/uopd_policy_loss.py): no PPO clipping
+            loss_impl = uopd_loss
+            loss_kwargs = dict(pad_id=self.pad_id, eos_id=self.eos_id, temperature=cfg["temperature"],
+                               sft_coef=cfg["sft_coef"], loss_agg_mode=cfg["loss_agg_mode"])
+        else:
+            loss_impl = opd_loss
 
         def score(params, prompt, comp):
             model = nnx.merge(graphdef, params, rest)
@@ -79,7 +87,7 @@ class TunixActorWorker:
 
         def grad_step(params, mb, scale, acc):
             def loss_fn(p):
-                loss, aux = opd_loss(nnx.merge(graphdef, p, rest), mb, **loss_kwargs)
+                loss, aux = loss_impl(nnx.merge(graphdef, p, rest), mb, **loss_kwargs)
                 return loss * scale, aux
 
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -123,6 +131,7 @@ class TunixActorWorker:
             comp = np.full((len(g), c), self.pad_id, np.int32)
             mask = np.zeros((len(g), c), bool)
             teacher = np.zeros((len(g), c), np.float32)
+            trig = np.zeros((len(g),), np.float32)
             seen = set()
             for r, i in enumerate(g):
                 row = rows[i]
@@ -131,8 +140,10 @@ class TunixActorWorker:
                 if i not in seen:  # duplicated filler rows stay masked out
                     mask[r, :len(row["response"])] = row["response_mask"]
                     teacher[r, :len(row["response"])] = row["teacher_logprobs"]
+                    trig[r] = float(row.get("triggered", False))
                 seen.add(i)
-            yield {"prompt": prompt, "comp": comp, "mask": mask, "teacher": teacher, "n_real": len(set(g)),
+            yield {"prompt": prompt, "comp": comp, "mask": mask, "teacher": teacher, "trig": trig,
+                   "n_real": len(set(g)),
                    "row_ids": g}
 
     # ------------------------------------------------------------------ step
@@ -171,7 +182,7 @@ class TunixActorWorker:
                 batch = _MicroBatch(
                     prompt_ids=jnp.asarray(mb["prompt"]), completion_ids=jnp.asarray(mb["comp"]),
                     completion_mask=jnp.asarray(mb["mask"]), old_per_token_logps=jnp.asarray(mb["old"]),
-                    advantages=jnp.asarray(mb["adv"], jnp.float32))
+                    advantages=jnp.asarray(mb["adv"], jnp.float32), triggered=jnp.asarray(mb["trig"]))
                 scale = mb["n_real"] / n_rows  # verl: response_mask.shape[0] / ppo_mini_batch_size
                 with self.mesh:
                     loss, aux, grads_sum = self._grad_step(self.params, batch, scale, grads_sum)
@@ -179,12 +190,20 @@ class TunixActorWorker:
                 acc["actor/pg_loss"] += float(loss)
                 for k in ("pg_clipfrac", "pg_clipfrac_lower", "ppo_kl", "entropy"):
                     acc.setdefault(f"actor/{k}", []).append(float(aux[k]))
+                # uopd only: branch losses of the micro batches that hold rows of that branch
+                if "uopd/sft_loss" in aux and mb["trig"].any():
+                    acc.setdefault("uopd/sft_loss", []).append(float(aux["uopd/sft_loss"]))
+                if "uopd/pg_loss" in aux and not mb["trig"].all():
+                    acc.setdefault("uopd/pg_loss", []).append(float(aux["uopd/pg_loss"]))
             with self.mesh:
                 self.params, self.opt_state, grad_norm = self._apply_grads(
                     self.params, self.opt_state, grads_sum)
             grad_norm = float(grad_norm)
         self.step += 1
         resp_len = [int(r["response_mask"].sum()) for r in rows]
+        if cfg.get("policy_loss", "ppo") == "uopd":
+            acc["uopd/trigger_rate"] = float(np.mean([bool(r.get("triggered", False)) for r in rows]))
+            acc["uopd/sft_coef"] = cfg["sft_coef"]
         prompt_len = [len(r["prompt"]) for r in rows]
         metrics = {k: (float(np.mean(v)) if isinstance(v, list) else v) for k, v in acc.items()}
         metrics.update({

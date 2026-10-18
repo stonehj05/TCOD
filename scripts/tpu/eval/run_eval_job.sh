@@ -12,7 +12,7 @@
 set -uo pipefail
 MODEL_PATH=$1 SERVED_NAME=$2 CHIP=$3 REP=$4 SPLIT=$5 START=$6 END=$7 OUT=$8
 # Eval protocol (TCOD paper): do not change these when comparing against existing results.
-WORKERS=${WORKERS:-8} MAX_ENV_STEPS=30 TEMPERATURE=0.4
+WORKERS=${WORKERS:-8} MAX_ENV_STEPS=${EVAL_MAX_ENV_STEPS:-30} TEMPERATURE=0.4  # UOPD's own setup: 50
 # Server sizing: lower these for a model that does not fit one chip's memory at 0.85.
 GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.85} MAX_MODEL_LEN=${MAX_MODEL_LEN:-40960}
 PROBE_DIR=${PROBE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/client}
@@ -55,9 +55,9 @@ if ! start_server "--runtime_metric_service_port=$(( 8431 + CHIP ))"; then
     free_chip; start_server "" || { echo "ERROR: server failed; see $LOG"; free_chip; exit 1; }
 fi
 $PY 12_evaluate_checkpoint.py --base-url "http://localhost:${PORT}/v1" --model "$SERVED_NAME" \
-    --checkpoint-label "${SERVED_NAME}_rep${REP}" --full-memory --split "$SPLIT" --workers "$WORKERS" \
+    --checkpoint-label "${SERVED_NAME}_rep${REP}" --full-memory ${EVAL_TEMPLATE:+--template "$EVAL_TEMPLATE"} --split "$SPLIT" --workers "$WORKERS" \
     --task-start "$START" --task-end "$END" \
-    --max-env-steps "$MAX_ENV_STEPS" --temperature "$TEMPERATURE" \
+    --max-env-steps "$MAX_ENV_STEPS" --temperature "$TEMPERATURE" ${EVAL_MAX_TOKENS:+--max-tokens "$EVAL_MAX_TOKENS"} \
     --seen-jsonl "$TASK_DIR/test.jsonl" \
     --unseen-jsonl "$TASK_DIR/test_unseen.jsonl" \
     --hard-jsonl "$TASK_DIR/train_hard.jsonl" \

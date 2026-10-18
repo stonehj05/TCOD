@@ -91,3 +91,40 @@ def opd_loss(model, train_example, *, pad_id, eos_id, temperature, clip_low, cli
         "is_ratio/min": jnp.min(jnp.where(mask > 0, ratio, jnp.inf)),
     }
     return loss, aux
+
+
+def uopd_loss(model, train_example, *, pad_id, eos_id, temperature, sft_coef=1.0,
+              loss_agg_mode="token-mean"):
+    """UOPD's UOPDPolicyLossFn (algorithm/policy_loss_fn/uopd_policy_loss.py) in JAX.
+
+    Per row: student-executed turns get the OPD policy gradient -A * ratio (log-ratio clamped to
+    +-20, no PPO clipping, as released); teacher-executed turns (`triggered`) get SFT on the
+    teacher's tokens, sft_coef * -log p. Both branches go through one token-mean aggregation.
+    """
+    mask = train_example.completion_mask.astype(jnp.float32)
+    logps, entropy = completion_logps(model, train_example.prompt_ids, train_example.completion_ids,
+                                      pad_id, eos_id, temperature, return_entropy=True)
+    old = train_example.old_per_token_logps.astype(jnp.float32)
+    adv = train_example.advantages.astype(jnp.float32)
+    trig = (train_example.triggered > 0.5)[:, None]  # [B, 1]
+
+    log_ratio = jnp.clip(logps - old, -20.0, 20.0)
+    ratio = jnp.exp(log_ratio)
+    pg_tok = -adv * ratio
+    sft_tok = sft_coef * (-logps)
+    per_token = jnp.where(trig, sft_tok, pg_tok)
+    loss = common.aggregate_loss(per_token, mask, loss_agg_mode)
+
+    trig_mask = mask * trig
+    pg_mask = mask * (~trig)
+    denom = jnp.clip(mask.sum(), min=1.0)
+    pg_denom = jnp.clip(pg_mask.sum(), min=1.0)
+    aux = {
+        "pg_clipfrac": jnp.zeros(()),
+        "pg_clipfrac_lower": jnp.zeros(()),
+        "ppo_kl": (-log_ratio * pg_mask).sum() / pg_denom,
+        "entropy": (jax.lax.stop_gradient(entropy) * mask).sum() / denom,
+        "uopd/sft_loss": jax.lax.stop_gradient((sft_tok * trig_mask).sum() / jnp.clip(trig_mask.sum(), min=1.0)),
+        "uopd/pg_loss": jax.lax.stop_gradient((pg_tok * pg_mask).sum() / pg_denom),
+    }
+    return loss, aux

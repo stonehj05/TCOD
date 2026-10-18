@@ -70,6 +70,18 @@ from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_student_teac
 )
 from trinity.utils.log import get_logger
 
+
+def _lookahead_fns(payload: Dict):
+    """(teacher_lookahead, lookahead_task) for the payload's game: ALFWorld unless the payload
+    says otherwise (OPD_gated_scienceworld_workflow_student_teacher_lookahead sets env)."""
+    if payload.get("env", "alfworld") == "scienceworld":
+        from trinity.common.workflows.envs.TCOD.scienceworld import (
+            OPD_gated_workflow_student_teacher_lookahead as sci,
+        )
+
+        return sci.teacher_lookahead, sci.lookahead_task
+    return teacher_lookahead, lookahead_task
+
 PAYLOAD_KEY = "opd_deferred"
 DEFAULT_PARALLEL_PER_TEACHER = 32
 CALL_ATTEMPTS = 3
@@ -89,7 +101,7 @@ class DeferredTeacherGate:
         # Look-ahead tasks replay ALFWorld games: give them the workflow runners' environment
         # (TMPDIR on tmpfs, see the training configs).
         self._task_env = dict(getattr(config.explorer, "env_vars", None) or {})
-        self._lookahead_remote = None
+        self._lookahead_remote = {}  # lookahead_task -> its Ray remote function
         aux = config.explorer.auxiliary_models
         self.teacher_names = [
             f"{config.explorer.name}_auxiliary_model_0_{j}" for j in range(aux[0].engine_num)
@@ -132,6 +144,7 @@ class DeferredTeacherGate:
         """Teacher look-ahead for one disagreed turn; None if it failed (the turn then keeps
         the full weight)."""
         args = (payload["game_file"], payload["prior_actions"], payload["step"], payload["gate"], payload["action"])
+        lookahead_fn, task_fn = _lookahead_fns(payload)
         try:
             if self.lookahead_in_process:
                 async def ask(messages, temperature, max_tokens):
@@ -140,14 +153,15 @@ class DeferredTeacherGate:
                     )
                     return responses[0].response_text or ""
 
-                return await teacher_lookahead(ask, args[0], memory[: 2 * payload["step"] + 1], *args[1:])
-            if self._lookahead_remote is None:
+                return await lookahead_fn(ask, args[0], memory[: 2 * payload["step"] + 1], *args[1:])
+            if task_fn not in self._lookahead_remote:
                 # max_calls=1: a fresh process per look-ahead. Every ALFWorld game leaves a
-                # 35 MB planner library mapped from TMPDIR (tmpfs) until its process exits.
-                self._lookahead_remote = ray.remote(
+                # 35 MB planner library mapped from TMPDIR (tmpfs) until its process exits
+                # (a ScienceWorld game: its Java server).
+                self._lookahead_remote[task_fn] = ray.remote(
                     num_cpus=1, max_calls=1, runtime_env={"env_vars": self._task_env}
-                )(lookahead_task)
-            return await self._lookahead_remote.remote(
+                )(task_fn)
+            return await self._lookahead_remote[task_fn].remote(
                 self.teacher_names[k % len(self.teacher_names)], self.namespace,
                 args[0], payload["memory_z"], *args[1:],
             )

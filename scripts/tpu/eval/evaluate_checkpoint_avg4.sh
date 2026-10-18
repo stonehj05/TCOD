@@ -65,7 +65,7 @@ for rep in $(seq 1 "$N_REPS"); do
             start=$(( part * n / PARTS )); end=$(( (part + 1) * n / PARTS ))
             read -r w chip <<< "${SLOTS[$(( job % C ))]}"
             out="$OUT_DIR/eval_${LABEL}.rep${rep}.${split}.part${part}"
-            cmd="PROBE_DIR='$PROBE_DIR' TASK_DIR='$TASK_DIR' VENV='$VENV' bash '$HERE/run_eval_job.sh' '$MODEL_PATH' '$LABEL' $chip $rep $split $start $end '$out'"
+            cmd="EVAL_TEMPLATE='${EVAL_TEMPLATE:-}' EVAL_MAX_TOKENS='${EVAL_MAX_TOKENS:-}' EVAL_MAX_ENV_STEPS='${EVAL_MAX_ENV_STEPS:-}' PROBE_DIR='$PROBE_DIR' TASK_DIR='$TASK_DIR' VENV='$VENV' bash '$HERE/run_eval_job.sh' '$MODEL_PATH' '$LABEL' $chip $rep $split $start $end '$out'"
             if [ "$w" = 0 ]; then bash -c "$cmd" > "$out.log" 2>&1 &
             else $SSH "${IPS[$w]}" "$cmd" > "$out.log" 2>&1 & fi
             echo "job $job: worker $w chip $chip rep$rep $split [$start,$end)"

@@ -49,6 +49,9 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         if algo.algorithm_type != "on_policy_distill":
             raise NotImplementedError(
                 f"tunix trainer implements on_policy_distill only, got {algo.algorithm_type}")
+        policy_loss = algo.policy_loss_fn or "ppo"
+        if policy_loss not in ("ppo", "uopd"):
+            raise NotImplementedError(f"tunix trainer implements policy_loss_fn ppo and uopd, got {policy_loss}")
         loss_args = {"clip_range": 0.2, "clip_ratio_c": 3.0, "loss_agg_mode": "token-mean",
                      **(algo.policy_loss_fn_args or {})}
         adv_args = {"kl_coef": 1.0, **(algo.advantage_fn_args or {})}
@@ -65,6 +68,9 @@ class TunixTrainerWrapper(TrainEngineWrapper):
             "clip_range_high": loss_args.get("clip_range_high") or loss_args["clip_range"],
             "clip_ratio_c": loss_args["clip_ratio_c"],
             "loss_agg_mode": loss_args["loss_agg_mode"],
+            # uopd (UOPD_alfworld_workflow): rows the teacher took over get SFT on its tokens
+            "policy_loss": policy_loss,
+            "sft_coef": float(loss_args.get("sft_coef", 1.0)),
             "ppo_epochs": 1,
             "rows_per_micro_batch": config.cluster.trainer_gpu_num,  # one row per chip
             "flash_block_size": block,
@@ -149,7 +155,8 @@ class TunixTrainerWrapper(TrainEngineWrapper):
         mask = (np.ones(len(response), bool) if exp.action_mask is None
                 else np.asarray(exp.action_mask, dtype=bool))
         return {"prompt": tokens[:exp.prompt_length], "response": response,
-                "response_mask": mask, "teacher_logprobs": teacher}
+                "response_mask": mask, "teacher_logprobs": teacher,
+                "triggered": bool((exp.info or {}).get("is_triggered", False))}
 
     async def train_step(self, batch_exps: List[Experience]) -> Dict:
         gate_metrics = await self.teacher_gate.annotate(batch_exps) if self.teacher_gate.enabled else {}

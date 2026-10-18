@@ -313,7 +313,17 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
             turn_responses[-1].metrics["env_done"] = 1.0 if self._env_done else 0.0
         return turn_responses
 
+    async def _teacher_lookahead(self, ask, context, actions, t, gate) -> Dict:
+        """The teacher's look-ahead from step `t` (hook: the ScienceWorld variant replays its game)."""
+        return await teacher_lookahead(ask, self.task_desc, context, actions, t, gate, actions[t])
+
     async def _run_episode(self, env) -> List[Experience]:
+        turn_responses, actions, memory = await self._rollout(env)
+        return await self._gate_and_score(turn_responses, actions, memory)
+
+    async def _rollout(self, env):
+        """Pass 1: the student's rollout. Returns (turn_responses, actions, memory) and sets
+        _env_done, _env_rounds and _final_reward."""
         observation, info = env.reset()
         self._env_done = False
         self._env_rounds = 0
@@ -358,7 +368,12 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
         else:
             self._env_rounds = self.max_env_steps
             self._final_reward = 0.0  # failure: exhausted max steps
+        return turn_responses, actions, memory
 
+    async def _gate_and_score(
+        self, turn_responses: List[Experience], actions: List[str], memory: List[Dict[str, str]]
+    ) -> List[Experience]:
+        """Passes 2 and 3 (or, with defer_teacher, the payloads for the trainer)."""
         n_total_steps = len(turn_responses)
 
         if self.defer_teacher:
@@ -381,9 +396,7 @@ class OPDGatedAlfworldWorkflowTeacherLookahead(OPDGatedAlfworldWorkflowAgreeLook
 
         async def lookahead(t):
             try:
-                return await teacher_lookahead(
-                    ask, self.task_desc, memory[: 2 * t + 1], actions, t, gate, actions[t]
-                )
+                return await self._teacher_lookahead(ask, memory[: 2 * t + 1], actions, t, gate)
             except Exception as e:  # keep the episode: the step then gets the full weight
                 self.logger.warning(f"teacher look-ahead failed at step {t}: {e!r}")
                 return None

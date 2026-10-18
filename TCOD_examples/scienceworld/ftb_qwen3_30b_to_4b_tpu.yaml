@@ -1,0 +1,142 @@
+# FutureBridge-OPD (FTB), "Look Ahead Before You Distill" (https://github.com/ChenChiShui/FutureBridge-OPD,
+# commit e73603a), on ScienceWorld, run as released, with OUR student / teacher: plain Qwen3-4B /
+# plain Qwen3-30B-A3B (the release's 4B config, configs/scienceworld/ftb_qwen3_32b_to_4b.yaml, uses a
+# Qwen3-32B teacher).
+# Workflow: trinity/common/workflows/envs/TCOD/scienceworld/futurebridge_workflow.py (the release's,
+# with its B2F base and utils.py copied as ftb_release_b2f_workflow.py / ftb_release_utils.py; one fix:
+# an undefined `logger`, see its docstring). What it does per training episode:
+#   1. Back-to-front curriculum (TCOD-B2F): the game is advanced along ScienceWorld's gold path by
+#      k = max(0, len(gold) - 1 - explore_step // checkpoint_steps) actions; the Student plays on (up
+#      to turn max_env_steps, so no Student turns while k >= 30).
+#   2. Vanilla OPD on every Student turn (the Teacher scores all turns).
+#   3. Every episode: at the Student turn with the largest token-average disagreement, the game is
+#      replayed along the GOLD path to that turn, the Teacher writes one action from that state (its
+#      prompt is that single turn), and the Student plays 4 turns on, scored by the Teacher (the
+#      bridge experiences). Future validation: the bridge is kept only if the share of tokens the
+#      Teacher prefers on 3 Student turns after the bridge action beats the Student's original next
+#      3 turns.
+#
+# As in the release's 4B config (and the code's defaults): prompt templates (TCOD's ScienceWorld
+# template with mandatory <think> tags, 2-step history line, full conversation; games loaded with no
+# simplification: ftb_release_utils.py), curriculum (linear, checkpoint_steps 5), bridge settings,
+# 200 training steps, 8 runners per engine, Teacher prompt limit 10240, lr, loss, thinking mode off,
+# checkpoint every 50 steps, no evaluation during training.
+# Not as in the release: the Teacher model (ours); the TPU backends and engine layout.
+# NOTE for evaluation: scripts/tpu/eval/client/13_evaluate_sciworld.py uses DASH-OPD's prompts and
+# simplification "easy" (this repo's utils.py), not the release's template / no simplification.
+#
+# The Teacher's work is done in the explorer for every episode (defer_teacher does not apply), so
+# expect the pace of the non-deferred runs (ALFWorld FTB: ~22 h for 200 steps).
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Launch: ~/tcod_runs/launch_sciworld_ftb.sh (cluster bring-up, checks, tmpfs links for
+# steps 150-200).
+project: "SCIENCEWORLD_TCOD"
+name: "scienceworld_ftb_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for steps 150-200) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only; the run ends on trainer.total_steps (release: 200)
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: sciworld
+      storage_type: file
+      path: /home/haojun_shi/sci-data/tcod_tasks/train.jsonl  # TCOD's get_sciworld_data.py split (2294 games), as the release's data/scienceworld; on every worker
+      split: train
+      format:
+        prompt_key: 'task_desc'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 30
+        total_steps: 200
+        checkpoint_strategy: linear
+        checkpoint_steps: 5
+        # The release's keys, verbatim. Its ScienceWorld workflow does not read them (see header).
+        bridge_max_per_ep: 1
+        bridge_position_top_k: 1
+        continuation_steps: 3
+        bridge_failed_episodes_only: false
+        bridge_require_full_continuation: true
+    default_workflow_type: 'FutureBridgeScienceWorldWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: scienceworld_ftb_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:////dev/shm/tcod_buffers/scienceworld_ftb_qwen3_30b_to_4b_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 9999   # as in the release: no evaluation during training
+  eval_on_startup: false
+  runner_per_model: 8   # as in the release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (release: 2 x TP2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+    enable_thinking: false
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (release: 1 x TP2)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      enable_thinking: false
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 10240  # as in the release
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 200  # as in the release
+  save_interval: 50  # as in the release
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

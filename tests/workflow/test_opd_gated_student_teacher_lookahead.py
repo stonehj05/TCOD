@@ -53,6 +53,7 @@ def run(defer, path):
     wf = T.make(M.OPDGatedAlfworldWorkflowStudentTeacherLookahead, defer, path)
     wf.teacher_model = Teacher()
     wf.gate_mode, wf.both_weight, wf.one_weight, wf.neither_weight = M.GATE_MODE, 1.0, 0.5, 0.0
+    wf.teacher_only_weight = wf.student_only_weight = wf.one_weight
     env = T._create_alfworld_env(path)
     try:
         exps = asyncio.run(wf._run_episode(env))
@@ -71,6 +72,12 @@ def check_weight_table():
     assert w(g, True, None, None) == 1.0     # unknowns never lower the weight
     assert w(g, True, False, None) == 0.5 and w(g, True, None, False) == 0.5
     assert all(w(g, False, s, t) == 0.0 for s in (True, False, None) for t in (True, False, None))
+    # separate weights for the two "exactly one" cases
+    g2 = dict(g, teacher_only_weight=0.7, student_only_weight=0.3)
+    assert w(g2, True, True, True) == 1.0 and w(g2, True, False, False) == 0.0
+    assert w(g2, True, False, True) == 0.7   # both progress
+    assert w(g2, True, True, False) == 0.3   # both stuck
+    assert w(g2, True, False, None) == 0.7 and w(g2, True, None, False) == 0.3
     assert WORKFLOWS.get("OPD_gated_alfworld_workflow_student_teacher_lookahead") is M.OPDGatedAlfworldWorkflowStudentTeacherLookahead
     print("weight table OK")
 

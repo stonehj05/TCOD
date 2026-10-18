@@ -18,7 +18,10 @@ Combines the two look-aheads used separately in OPD_gated_workflow_agree_lookahe
 OPD weight of a step the teacher disagrees with, from the two conditions
     S = the student is NOT making progress      T = the teacher IS making progress
     S and T          -> both_weight     (1.0)   the teacher does better from here: full OPD
-    exactly one      -> one_weight      (0.5)
+    exactly one      -> one_weight      (0.5), or separately:
+        T only       -> teacher_only_weight  (the student progresses too)
+        S only       -> student_only_weight  (neither side progresses)
+      (each defaults to one_weight)
     neither          -> neither_weight  (0.0)   the student progresses and the teacher does not
 A step the teacher agrees with always gets 0.
 
@@ -56,8 +59,14 @@ def combined_weight(
     making progress). See the module docstring."""
     if not disagree:
         return 0.0
-    met = int(student_not_progress is not False) + int(teacher_progress is not False)
-    return (gate["neither_weight"], gate["one_weight"], gate["both_weight"])[met]
+    s, t = student_not_progress is not False, teacher_progress is not False
+    if s and t:
+        return gate["both_weight"]
+    if t:
+        return gate.get("teacher_only_weight", gate["one_weight"])
+    if s:
+        return gate.get("student_only_weight", gate["one_weight"])
+    return gate["neither_weight"]
 
 
 def deferred_payload(
@@ -83,6 +92,8 @@ class OPDGatedAlfworldWorkflowStudentTeacherLookahead(OPDGatedAlfworldWorkflowTe
         self.gate_mode = GATE_MODE
         self.both_weight = args.get("both_weight", 1.0)
         self.one_weight = args.get("one_weight", 0.5)
+        self.teacher_only_weight = args.get("teacher_only_weight", self.one_weight)
+        self.student_only_weight = args.get("student_only_weight", self.one_weight)
         self.neither_weight = args.get("neither_weight", 0.0)
 
     def gate_config(self) -> Dict:
@@ -91,6 +102,8 @@ class OPDGatedAlfworldWorkflowStudentTeacherLookahead(OPDGatedAlfworldWorkflowTe
             gate_mode=GATE_MODE,
             both_weight=self.both_weight,
             one_weight=self.one_weight,
+            teacher_only_weight=self.teacher_only_weight,
+            student_only_weight=self.student_only_weight,
             neither_weight=self.neither_weight,
         )
         return gate

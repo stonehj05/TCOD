@@ -128,10 +128,12 @@ def _worker(
     shard_output_path: str,
     keep_step_log: bool,
     full_memory: bool,
+    template: str = "paper",
 ):
     t0 = time.time()
     print(f"[worker {worker_id}] processing {len(tasks)} games (full_memory={full_memory})")
     run_episode = run_episode_full_memory.run_episode if full_memory else run_episode_tcod.run_episode
+    extra = {"template": template} if template != "paper" else {}
 
     model_client = ChatModel(
         base_url=base_url,
@@ -151,7 +153,9 @@ def _worker(
             game_file = task["game_file"]
             env = None
             try:
-                env = _create_alfworld_env(game_file)
+                # uopd: UOPD's game setup (AlfredInfos, `won` reported), as in its workflows
+                env = (run_episode_full_memory.uopd_utils()._create_alfworld_env(game_file)
+                       if template == "uopd" else _create_alfworld_env(game_file))
                 observation, info = env.reset()
                 task_description = _extract_task(observation)
 
@@ -164,6 +168,7 @@ def _worker(
                     history=None,
                     start_step=0,
                     max_steps=max_env_steps,
+                    **extra,
                 )
 
                 record = {
@@ -292,6 +297,11 @@ def main():
     parser.add_argument("--mock-model", action="store_true")
     parser.add_argument("--keep-step-log", action="store_true", default=True)
     parser.add_argument("--no-keep-step-log", dest="keep_step_log", action="store_false")
+    parser.add_argument("--template", choices=run_episode_full_memory.TEMPLATES, default="paper",
+                        help="Prompt template for --full-memory: 'paper' (default) or "
+                             "'release_think' (FutureBridge-OPD release: <think> tags) or "
+                             "'tcod_train' (TCOD workflow's turn-3 switch to the history prompt) or "
+                             "'uopd' (UOPD's rollout: its templates, one message per turn with the last 2 steps, success = won).")
     parser.add_argument("--full-memory", action="store_true",
                          help="Use run_episode.py's growing-conversation rollout "
                               "loop (every turn's full user+assistant messages "
@@ -320,7 +330,7 @@ def main():
         f"Evaluating model={args.model!r} on {len(tasks)} tasks ({counts_str}) "
         f"across {len(shards)} worker(s), max_env_steps={args.max_env_steps}, "
         f"temperature={args.temperature}, mock={args.mock_model}, "
-        f"full_memory={args.full_memory}"
+        f"full_memory={args.full_memory} template={args.template}"
     )
 
     ctx = mp.get_context("spawn")
@@ -345,6 +355,7 @@ def main():
                 shard_output_path=shard_path,
                 keep_step_log=args.keep_step_log,
                 full_memory=args.full_memory,
+                template=args.template,
             ),
         )
         p.start()

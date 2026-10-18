@@ -20,6 +20,7 @@ POLICY_LOSS_FN: Registry = Registry(
         "sapo": "trinity.algorithm.policy_loss_fn.sapo_policy_loss.SAPOPolicyLossFn",
         "importance_sampling": "trinity.algorithm.policy_loss_fn.importance_sampling_policy_loss.ImportanceSamplingLossFn",
         "sdpo": "trinity.algorithm.policy_loss_fn.sdpo_policy_loss.SDPOPolicyLossFn",
+        "uopd": "trinity.algorithm.policy_loss_fn.uopd_policy_loss.UOPDPolicyLossFn",
     },
 )
 
