@@ -7,7 +7,7 @@ alone exceed a v4 chip's HBM. Here the decoder stack runs over the whole
 sequence but the LM head only over the positions that predict completion
 tokens.
 
-Works for Tunix's Qwen2/Qwen3 (embedder / layers / final_norm / lm_head).
+Works for Tunix's Qwen2/Qwen3 (embedder / layers / final_norm / lm_head) and Gemma 4 (gemma4.py).
 """
 
 import functools
@@ -18,7 +18,15 @@ from flax import nnx
 from tunix.rl import common
 
 
+def _is_gemma4(model):
+    return type(model).__name__ == "Gemma4"
+
+
 def _hidden_states(model, input_tokens, positions, attn_mask, segment_ids):
+    if _is_gemma4(model):
+        from trinity.trainer.tunix import gemma4
+
+        return gemma4.hidden_states(model, input_tokens, positions, attn_mask)
     x = model.embedder.encode(input_tokens)
     for layer in model.layers:
         _, x = layer(x, positions, None, attn_mask, segment_ids=segment_ids)
@@ -26,6 +34,10 @@ def _hidden_states(model, input_tokens, positions, attn_mask, segment_ids):
 
 
 def _project(model, h):
+    if _is_gemma4(model):
+        from trinity.trainer.tunix import gemma4
+
+        return gemma4.project(model, h)
     if model.config.use_tied_embedding:
         return model.embedder.decode(h)
     return model.lm_head(h)

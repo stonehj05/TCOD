@@ -1,0 +1,121 @@
+# Vanilla OPD on WebShop: the baseline of our gated WebShop run,
+# TCOD_examples/webshop/opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu.yaml, with the gate
+# removed. Every value is that run's (TCOD's train/test sessions, DASH-OPD's WebShop prompts, full memory,
+# 15 game steps, 150 training steps, a checkpoint every 25 steps, DASH-OPD's task / experience shuffling
+# with seed 42, lr 1e-6, batch 16 games / 64 turns, staleness 2, 10240 / 512 tokens, temperature 1.0)
+# except the workflow: OPD_webshop_workflow_dashtpl (envs/TCOD/webshop/OPD_workflow_dashtpl.py: the same
+# rollout; the teacher scores every turn at full weight, no agreement / progress question, no look-ahead).
+# This is the vanilla OPD of DASH-OPD's paper (App. M Table 6: sampled reverse KL on every student turn).
+#
+# Needs WebShop's data, index and packages on every worker, as the gated run (see its header).
+# TPU layout and launch as the gated run: ~/tcod_runs/launch_webshop_vanilla.sh
+project: "WEBSHOP_TCOD"
+name: "webshop_opd_dashtpl_deferred_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+# Mechanism: trinity/common/workflows/envs/TCOD/webshop/OPD_workflow_dashtpl.py
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B, as our other runs (TCOD's WebShop opd.yaml: Qwen2.5-3B-Instruct).
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's get_webshop_data.py (4096 train sessions); on every worker
+      split: train
+      task_selector:  # DASH-OPD's WebShop configs (paper App. M: seed 42 everywhere); 150 x 16 < 4096: one epoch
+        selector_type: shuffle
+        seed: 42
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0  # as TCOD's WebShop configs (the workflow default)
+        max_env_steps: 15  # TCOD's WebShop configs
+        # The trainer scores the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+    default_workflow_type: 'OPD_webshop_workflow_dashtpl'
+  trainer_input:
+    experience_buffer:
+      name: webshop_opd_dashtpl_deferred_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true  # DASH-OPD's WebShop configs
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_opd_dashtpl_deferred_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B, as our other runs (TCOD's opd.yaml: /path/to/teacher).
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 150  # TCOD's WebShop configs
+  save_interval: 25  # user, 2026-10-21; last three = 100 / 125 / 150
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

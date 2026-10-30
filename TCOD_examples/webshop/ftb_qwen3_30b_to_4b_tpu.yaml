@@ -1,0 +1,145 @@
+# FutureBridge-OPD (FTB), "Look Ahead Before You Distill" (https://github.com/ChenChiShui/FutureBridge-OPD,
+# commit e73603a), on WebShop, run as released, with OUR student / teacher: plain Qwen3-4B / plain
+# Qwen3-30B-A3B (the release's 4B config, configs/webshop/ftb_qwen3_32b_to_4b.yaml, uses a Qwen3-32B teacher).
+# Every value is that config's (user, 2026-10-22: "keep everything the same as their original config"),
+# except:
+#   - the shop (user, 2026-10-22, as for UOPD: our env): the WebShop of our other WebShop runs -- full
+#     product set, HUMAN goals, TCOD's sessions (the release's data/webshop = TCOD's get_webshop_data.py,
+#     sessions 0-4095 / 4096-4195, the same ids), `text_rich` observations as the release, on our shared
+#     WebShop servers (env_server.py). The release uses synthetic goals (human_goals=False).
+#   - the Teacher model, the TPU backends / engine layout, and no in-training eval (the release:
+#     eval_interval 9999, i.e. none either).
+# Workflow: trinity/common/workflows/envs/TCOD/webshop/futurebridge_workflow.py (the release's, with its
+# futurebridge_base.py / TCOD_b2f_workflow.py / utils.py copied as ftb_release_base.py /
+# ftb_release_b2f_workflow.py / ftb_release_utils.py; one fix: FTB (full) calls a continuation check the
+# release defines only on an ablation subclass, see its docstring). What it does per training episode:
+#   1. Back-to-front curriculum with a live teacher: the Teacher plays the first
+#      k = max(0, 14 - explore_step // checkpoint_steps) steps online (temperature 1.0); if it ends the
+#      game inside them, the Student plays the whole game instead. The Student plays on to step 15.
+#   2. Vanilla OPD on every Student turn (the Teacher scores all turns).
+#   3. If the episode's reward < 0.5: at the Student turn with the largest token-average disagreement,
+#      the Teacher writes its own response from that turn's prompt (the bridge). Future validation: the
+#      game is replayed (Teacher prefix + Student actions), the bridge action executed, and the Student
+#      plays 3 steps on; the bridge is kept only if the share of tokens the Teacher prefers on those
+#      3 turns beats that of the Student's original next 3 turns. Bridge experiences: OPD on the
+#      Teacher's tokens.
+# Prompts (the release's utils.py): TCOD's WebShop template (no <think> tags), the last 2
+# observation-action pairs in the message, the full conversation as memory; its lenient action parser.
+# 200 training steps, a checkpoint every 50, 8 runners per engine, Teacher prompt limit 10240, lr, loss,
+# thinking off for both models. Of the release's workflow_args the WebShop code reads only temperature,
+# max_env_steps, total_steps, checkpoint_strategy, checkpoint_steps, bridge_reward_threshold and
+# bridge_max_per_ep; the others are kept verbatim below and not read.
+#
+# The Teacher's work is done in the explorer for every episode (defer_teacher does not apply).
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Launch: ~/tcod_runs/launch_webshop_ftb.sh (cluster bring-up, checks, tmpfs links).
+project: "WEBSHOP_TCOD"
+name: "webshop_ftb_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only; the run ends on trainer.total_steps (release: 200)
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's 4096 train sessions = the release's data/webshop; on every worker
+      split: train
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 15
+        total_steps: 200
+        checkpoint_strategy: linear
+        checkpoint_steps: 5
+        bridge_reward_threshold: 0.5
+        bridge_max_per_ep: 1
+        # The release's keys, verbatim. Its WebShop workflow does not read them (see header).
+        bridge_position_top_k: 1
+        continuation_steps: 3
+        bridge_failed_episodes_only: false
+        bridge_require_full_continuation: true
+        b2f_prefix_source: reference
+    default_workflow_type: 'trinity.common.workflows.envs.TCOD.webshop.futurebridge_workflow.FutureBridgeWebShopWorkflow'
+  trainer_input:
+    experience_buffer:
+      name: webshop_ftb_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_ftb_qwen3_30b_to_4b_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 9999   # as in the release: no evaluation during training
+  eval_on_startup: false
+  runner_per_model: 8   # as in the release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (release: 2 x TP2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+    enable_thinking: false
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (release: 1 x TP2)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      enable_thinking: false
+      dtype: bfloat16
+      max_model_len: 20480
+      max_prompt_tokens: 10240  # as in the release
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 200  # as in the release
+  save_interval: 50  # as in the release
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

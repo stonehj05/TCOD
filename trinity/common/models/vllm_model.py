@@ -196,9 +196,13 @@ class vLLMRolloutModel(BaseInferenceModel):
         if self.tokenizer is None:
             await self._initialize_tokenizer()
 
-        token_ids, is_valid = self._handle_prompt_truncation(prompt, **kwargs)
-        if not is_valid:
-            return token_ids
+        truncate_status = None
+        if getattr(self.config, "prompt_truncation_keep_recent", False):
+            token_ids, truncate_status = self._truncate_prompt_keep_recent(prompt)
+        else:
+            token_ids, is_valid = self._handle_prompt_truncation(prompt, **kwargs)
+            if not is_valid:
+                return token_ids
 
         output = await self._generate_internal(
             prompt={"prompt_token_ids": token_ids}, lora_request=lora_request, **kwargs
@@ -228,6 +232,9 @@ class vLLMRolloutModel(BaseInferenceModel):
             )
             for i in range(len(output.outputs))
         ]
+        # set after construction: Experience masks out a "prompt_truncated" response when built with it
+        for experience in experiences:
+            experience.truncate_status = truncate_status or experience.truncate_status
         return experiences
 
     async def chat_mm(
@@ -342,8 +349,14 @@ class vLLMRolloutModel(BaseInferenceModel):
             lora_request=lora_request,
             **kwargs,
         )
+        # Look each token up by id: vLLM-TPU (seen on v4, 2026-10-28) returns the <pad> entry instead of the
+        # prompt token at chunked-prefill boundaries (positions that are multiples of max_num_batched_tokens).
+        # Such a token's logprob is unknown: NaN, which callers must mask.
         return torch.tensor(
-            [list(logprob_dict.values())[0].logprob for logprob_dict in output.prompt_logprobs[1:]],
+            [
+                d[t].logprob if t in d else float("nan")
+                for t, d in zip(token_ids[1:], output.prompt_logprobs[1:])
+            ],
             dtype=torch.float32,
         )
 

@@ -55,6 +55,12 @@ class TunixActorWorker:
         # Functional state: fp32 master params (sharded over `fsdp`) + optax state.
         self.graphdef, self.params, self.rest = nnx.split(model, nnx.Param, ...)
         del model
+        from trinity.trainer.tunix import gemma4
+
+        # Gemma 4: the per-layer embedding table is frozen (bf16, no update, no optimizer state)
+        self.gemma4 = gemma4.is_gemma4(self.model_dir)
+        if self.gemma4:
+            self.params = gemma4.freeze(self.params)
         self.param_shardings = jax.tree.map(lambda x: x.sharding, self.params)
         opt = cfg["optimizer"]
         # torch.optim.AdamW (verl's default) == optax.adamw with the same betas/eps/wd.
@@ -63,6 +69,8 @@ class TunixActorWorker:
             optax.adamw(opt["lr"], b1=opt["betas"][0], b2=opt["betas"][1], eps=1e-8,
                         weight_decay=opt["weight_decay"]),
         )
+        if self.gemma4:
+            self.tx = gemma4.optimizer(self.tx, self.params)
         with self.mesh:
             self.opt_state = self.tx.init(self.params)  # zeros_like keeps the param sharding
         self.pad_id = cfg["pad_token_id"]
@@ -85,9 +93,11 @@ class TunixActorWorker:
             model = nnx.merge(graphdef, params, rest)
             return jax.lax.stop_gradient(completion_logps(model, prompt, comp, pad_id, eos_id, temperature))
 
+        frozen_grad = gemma4.stop_frozen_grad if self.gemma4 else (lambda p: p)
+
         def grad_step(params, mb, scale, acc):
             def loss_fn(p):
-                loss, aux = loss_impl(nnx.merge(graphdef, p, rest), mb, **loss_kwargs)
+                loss, aux = loss_impl(nnx.merge(graphdef, frozen_grad(p), rest), mb, **loss_kwargs)
                 return loss * scale, aux
 
             (loss, aux), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)

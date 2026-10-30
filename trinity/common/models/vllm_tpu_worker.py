@@ -15,8 +15,11 @@ hidden]). Embeddings and norms keep the HF layout. The compiled model reads
 import glob
 import os
 
-# HF weights stored untransposed in vLLM-TPU.
-_NO_TRANSPOSE_SUFFIXES = ("embed_tokens.weight",)
+# HF weights stored untransposed in vLLM-TPU (embed_tokens_per_layer: Gemma 4's per-layer table).
+_NO_TRANSPOSE_SUFFIXES = ("embed_tokens.weight", "embed_tokens_per_layer.weight")
+# Gemma 4: vLLM-TPU fuses the HF gate_proj / up_proj into one [hidden, 2 * intermediate] gate_up_proj
+# (gate first). Qwen keeps them separate, so this only applies when the fused key exists.
+_FUSED_MLP = (".mlp.gate_proj.weight", ".mlp.up_proj.weight")
 
 
 def _state_key(hf_name: str) -> tuple:
@@ -75,14 +78,29 @@ class TPUWorkerExtension:
         files = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
         if not files:
             raise FileNotFoundError(f"no *.safetensors in {checkpoint_dir}")
+        pending_mlp = {}  # Gemma 4: fused gate_up_proj name -> {"gate": HF [out, in], "up": HF [out, in]}
         for f in files:
             with safe_open(f, framework="flax") as st:  # numpy has no bfloat16
                 for name in st.keys():
                     i = index.get(_state_key(name))
+                    tensor = None
+                    if i is None and name.endswith(_FUSED_MLP):
+                        fused = name.rsplit(".mlp.", 1)[0] + ".mlp.gate_up_proj.weight"
+                        if _state_key(fused) in index:
+                            slot = pending_mlp.setdefault(fused, {})
+                            slot["gate" if name.endswith(_FUSED_MLP[0]) else "up"] = st.get_tensor(name)
+                            if len(slot) < 2:
+                                continue
+                            import jax.numpy as jnp
+
+                            # HF [out, in] each -> one HF-layout [2 * out, in]; transposed below
+                            tensor = jnp.concatenate([slot["gate"], slot["up"]], axis=0)
+                            name, i = fused, index[_state_key(fused)]
+                            del pending_mlp[fused]
                     if i is None:
                         continue
                     old = leaves[i]
-                    new = _to_vllm_layout(name, st.get_tensor(name), old.shape)
+                    new = _to_vllm_layout(name, st.get_tensor(name) if tensor is None else tensor, old.shape)
                     leaves[i] = jax.device_put(new.astype(old.dtype), old.sharding)
                     # Free the old buffer now instead of when the whole state is swapped:
                     # otherwise a reload needs a second full copy of the weights in HBM

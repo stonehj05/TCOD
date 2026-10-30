@@ -70,16 +70,24 @@ from trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_student_teac
 )
 from trinity.utils.log import get_logger
 
+DISAGREE_ONLY_MODE = "disagree_only"  # OPD_gated_workflow_disagree_only.py: the agreement question alone
+
 
 def _lookahead_fns(payload: Dict):
     """(teacher_lookahead, lookahead_task) for the payload's game: ALFWorld unless the payload
-    says otherwise (OPD_gated_scienceworld_workflow_student_teacher_lookahead sets env)."""
+    says otherwise (the ScienceWorld and WebShop student_teacher_lookahead workflows set env)."""
     if payload.get("env", "alfworld") == "scienceworld":
         from trinity.common.workflows.envs.TCOD.scienceworld import (
             OPD_gated_workflow_student_teacher_lookahead as sci,
         )
 
         return sci.teacher_lookahead, sci.lookahead_task
+    if payload.get("env") == "webshop":
+        from trinity.common.workflows.envs.TCOD.webshop import (
+            OPD_gated_workflow_student_teacher_lookahead as shop,
+        )
+
+        return shop.teacher_lookahead, shop.lookahead_task
     return teacher_lookahead, lookahead_task
 
 PAYLOAD_KEY = "opd_deferred"
@@ -108,6 +116,9 @@ class DeferredTeacherGate:
         ] if aux else []
         self.namespace = config.ray_namespace
         self.teachers = teachers  # Ray actor handles; looked up on first use
+        self.student_name = f"{config.explorer.name}_rollout_model_0"
+        self._marker: Optional[List[int]] = None  # see _teacher_marker
+        self._prompt_tail: List[int] = []
         self._limits: List[asyncio.Semaphore] = []
         self._next = 0
 
@@ -132,6 +143,34 @@ class DeferredTeacherGate:
                         raise
                     self.logger.warning(f"teacher {method} failed ({e!r}); retrying")
                     await asyncio.sleep(2.0)
+
+    async def _teacher_marker(self) -> List[int]:
+        """Tokens the teacher's chat template adds to the student's generation prompt, inserted between a
+        turn's prompt and its response when the teacher scores it. Gemma 4 26B / 31B with thinking off end the
+        prompt with an empty thought block (`<|channel>thought\\n<channel|>`) that E2B's template lacks; without
+        it the teacher scores the student's reply as if thinking were on (P(open a thought block) 0.97 vs 0.03,
+        measured 2026-10-28). Empty when the templates agree (e.g. Qwen3 -> Qwen3) or differ otherwise."""
+        if self._marker is None:
+            probe = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+            student = ray.get_actor(self.student_name, namespace=self.namespace)
+            s_gen, s_bare, t_gen = await asyncio.gather(
+                student.prompt_token_ids.remote(probe), student.prompt_token_ids.remote(probe, False),
+                self.teachers[0].prompt_token_ids.remote(probe),
+            )
+            extra = len(t_gen) > len(s_gen) and t_gen[: len(s_gen)] == s_gen
+            self._marker = t_gen[len(s_gen):] if extra else []
+            # the student's generation prompt (e.g. `<|turn>model\n`): insert only after it
+            self._prompt_tail = s_gen[len(s_bare):] if s_gen[: len(s_bare)] == s_bare else s_gen[-1:]
+            self.logger.info(f"teacher scoring marker: {self._marker} after student prompt tail {self._prompt_tail}")
+        return self._marker
+
+    def _teacher_tokens(self, exp: Experience, marker: List[int]):
+        """(tokens to score, index of the first response logprob) for one turn."""
+        tokens, pl = exp.tokens.tolist(), exp.prompt_length
+        tail = self._prompt_tail
+        if marker and tail and tokens[pl - len(tail): pl] == tail:
+            return tokens[:pl] + marker + tokens[pl:], pl + len(marker) - 1
+        return tokens, pl - 1
 
     async def _ask(self, messages: List[Dict[str, str]], temperature: float, max_tokens: int):
         responses = await self._call(
@@ -206,9 +245,10 @@ class DeferredTeacherGate:
         agree_answers = dict(zip(gated, agree_list))
         progress_answers = dict(zip(sum_mode, early))
         # disagree_required: progress only matters where the teacher disagreed.
+        # disagree_only (OPD_gated_workflow_disagree_only.py, the look-ahead ablation): no progress question.
         late = [
             i for i in windowed
-            if payloads[i]["gate"]["gate_mode"] != "sum" and agree_answers[i][0] is not True
+            if payloads[i]["gate"]["gate_mode"] not in ("sum", DISAGREE_ONLY_MODE) and agree_answers[i][0] is not True
         ]
         # teacher_lookahead: the teacher plays ahead from the turns it disagreed with.
         ahead = [
@@ -250,7 +290,7 @@ class DeferredTeacherGate:
                 says_progress = progress_answers[i][0]
                 n_prog_bad += says_progress is None
                 not_progress = says_progress is not True
-            elif not payloads[i]["has_window"]:
+            elif not payloads[i]["has_window"] and payloads[i]["gate"]["gate_mode"] != DISAGREE_ONLY_MODE:
                 not_progress = not bool(payloads[i]["final_reward"])
             if payloads[i]["gate"]["gate_mode"] == COMBINED_MODE:
                 result = lookaheads.get(i)
@@ -275,20 +315,31 @@ class DeferredTeacherGate:
 
         t_prompts = time.time() - t0
         score = [i for i in range(n) if weights[i] != 0.0 or not self.skip_zero_weight_scoring]
+        marker = await self._teacher_marker() if score else []
+        inputs = {i: self._teacher_tokens(turns[i], marker) for i in score}
         scored = await asyncio.gather(*[
-            self._call("logprobs", turns[i].tokens.tolist(), temperature=payloads[i]["gate"]["temperature"])
+            self._call("logprobs", inputs[i][0], temperature=payloads[i]["gate"]["temperature"])
             for i in score
         ])
         teacher_logprobs = dict(zip(score, scored))
         raw_kl = []
+        n_missing = n_marked = 0
         for i, exp in enumerate(turns):
             student = exp.logprobs
+            valid = torch.full((len(student),), True, dtype=torch.bool)
             if i in teacher_logprobs:
-                teacher = teacher_logprobs[i][exp.prompt_length - 1:]
+                teacher = teacher_logprobs[i][inputs[i][1]:]
                 assert len(teacher) == len(student), (
                     f"Length mismatch: teacher_logprobs={len(teacher)}, student_logprobs={len(student)}. "
                     f"tokens={len(exp.tokens)}, prompt_length={exp.prompt_length}"
                 )
+                n_marked += len(inputs[i][0]) != len(exp.tokens)
+                # tokens the teacher engine returned no logprob for (vLLM.logprobs: NaN): no signal there
+                missing = torch.isnan(teacher)
+                if missing.any():
+                    n_missing += int(missing.sum())
+                    teacher = torch.where(missing, student, teacher)
+                    valid &= ~missing
                 raw_kl.append((student - teacher).sum().item())
                 # ungated turns keep the teacher's logprobs untouched, as the vanilla workflow stores them
                 exp.teacher_logprobs = (
@@ -296,7 +347,7 @@ class DeferredTeacherGate:
                 )
             else:  # weight 0, not scored: blending would give the student's own logprobs anyway
                 exp.teacher_logprobs = student.clone()
-            exp.teacher_logprobs_valid_mask = torch.full((len(student),), True, dtype=torch.bool)
+            exp.teacher_logprobs_valid_mask = valid
             del exp.info[PAYLOAD_KEY]
 
         metrics = {
@@ -305,6 +356,8 @@ class DeferredTeacherGate:
             "time/teacher_gate_scoring": time.time() - t0 - t_prompts,
             "teacher_gate/turns": n,
             "teacher_gate/scored_turns": len(score),
+            "teacher_gate/marked_turns": n_marked,  # scored with the teacher's generation-prompt marker
+            "teacher_gate/missing_teacher_logprobs": n_missing,  # response tokens masked out (no teacher logprob)
         }
         if raw_kl:
             metrics["teacher_gate/raw_kl_per_turn"] = sum(raw_kl) / len(raw_kl)

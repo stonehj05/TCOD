@@ -25,6 +25,26 @@ def chips_per_host() -> int:
     return 4
 
 
+def moe_env_vars(model_path: str) -> Dict:
+    """Extra env for a Gemma 4 MoE engine (26B-A4B) on TPU v4, as tested 2026-10-27: the vLLM model path
+    (the auto flax_nnx path keeps the experts unsharded and runs out of HBM) and the gmm_v2 tile patch in
+    tpu_moe_site/sitecustomize.py. Empty for every other model."""
+    import json
+    import os
+
+    cfg = os.path.join(model_path, "config.json")
+    if not os.path.isfile(cfg):
+        return {}
+    with open(cfg) as f:
+        c = json.load(f)
+    if not (c.get("architectures", [""])[0].startswith("Gemma4")
+            and c.get("text_config", c).get("enable_moe_block")):
+        return {}
+    site = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tpu_moe_site")
+    path = os.environ.get("PYTHONPATH")
+    return {"MODEL_IMPL_TYPE": "vllm", "PYTHONPATH": site + (":" + path if path else "")}
+
+
 def whole_host_runtime_env(n_chips: int) -> Dict:
     """Ray runtime_env for an actor that takes every chip of a host (e.g. a 4-chip trainer or
     a tensor_parallel_size=4 engine on TPU v4).

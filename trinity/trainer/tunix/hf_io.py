@@ -1,4 +1,4 @@
-"""Hugging Face checkpoint <-> Tunix NNX model (Qwen2/Qwen3 dense).
+"""Hugging Face checkpoint <-> Tunix NNX model (Qwen2/Qwen3 dense; Gemma 4 in gemma4.py).
 
 Loading uses Tunix's own safetensors loader. Saving inverts its key/layout
 mapping (tunix/models/qwen3/params.py): Tunix stores linear weights as [in, out]
@@ -51,6 +51,12 @@ def tunix_model_name(model_dir: str) -> str:
 
 
 def load_model(model_dir: str, mesh, dtype=jnp.float32, **config_overrides):
+    from trinity.trainer.tunix import gemma4
+
+    if gemma4.is_gemma4(model_dir):
+        return gemma4.load_model(model_dir, mesh, dtype, remat=config_overrides["remat_config"].name,
+                                 flash_block=config_overrides["flash_attention_block_size"],
+                                 use_flash_attention=config_overrides["use_flash_attention"])
     from tunix.models import automodel
 
     name = tunix_model_name(model_dir)
@@ -106,6 +112,10 @@ def _hf_tensors(model, dtype=None) -> dict:
 
 def save_hf_checkpoint(model, base_model_dir: str, output_dir: str, dtype: str = "bfloat16") -> str:
     """Write `model` as a HF safetensors checkpoint (plus the base model's config/tokenizer)."""
+    from trinity.trainer.tunix import gemma4
+
+    if gemma4.is_gemma4(base_model_dir):
+        return gemma4.save_hf_checkpoint(model, base_model_dir, output_dir, dtype)
     import shutil
 
     import ml_dtypes

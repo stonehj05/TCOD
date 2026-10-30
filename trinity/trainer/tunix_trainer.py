@@ -56,9 +56,13 @@ class TunixTrainerWrapper(TrainEngineWrapper):
                      **(algo.policy_loss_fn_args or {})}
         adv_args = {"kl_coef": 1.0, **(algo.advantage_fn_args or {})}
         model = config.model
+        from trinity.trainer.tunix import gemma4
+        from trinity.trainer.tunix.hf_io import resolve_model_dir
         from trinity.trainer.tunix.worker import default_seq_buckets
 
-        block = 512
+        # Gemma 4: 256 (512 overflows v4 VMEM with its 512-wide global heads; see tunix/gemma4.py)
+        self._gemma4 = gemma4.is_gemma4(resolve_model_dir(config.model.model_path))
+        block = gemma4.FLASH_BLOCK if self._gemma4 else 512
         self.worker_cfg = {
             "model_path": model.model_path,
             "max_response_tokens": model.max_response_tokens,
@@ -107,7 +111,10 @@ class TunixTrainerWrapper(TrainEngineWrapper):
 
         tok = AutoTokenizer.from_pretrained(resolve_model_dir(self.config.model.model_path))
         self.worker_cfg["pad_token_id"] = tok.pad_token_id
-        self.worker_cfg["eos_token_id"] = tok.convert_tokens_to_ids("<|im_end|>")
+        from trinity.trainer.tunix import gemma4
+
+        self.worker_cfg["eos_token_id"] = tok.convert_tokens_to_ids(
+            gemma4.END_OF_TURN if self._gemma4 else "<|im_end|>")
         resume_step = None
         if self.config.continue_from_checkpoint and os.path.exists(self.local_latest_checkpointed_iteration):
             with open(self.local_latest_checkpointed_iteration) as f:

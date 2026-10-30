@@ -1,0 +1,14 @@
+{
+  "citation": "",
+  "description": "Custom dataset",
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_examples": 4096
+    },
+    "test": {
+      "name": "test",
+      "num_examples": 100
+    }
+  }
+}

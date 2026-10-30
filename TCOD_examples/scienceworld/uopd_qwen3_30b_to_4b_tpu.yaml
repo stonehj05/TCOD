@@ -1,0 +1,156 @@
+# UOPD, "Uncertainty-Aware Intervention for On-Policy Distillation of Multi-Turn Agents"
+# (https://github.com/onepounchman/UOPD, commit 61f90c5) on ScienceWorld, with OUR student / teacher: plain
+# Qwen3-4B / plain Qwen3-30B-A3B. The release covers ALFWorld and WebShop only, so this is a port:
+# UOPD's algorithm exactly as in our ALFWorld port (TCOD_examples/alfworld/uopd_qwen3_30b_to_4b_tpu.yaml),
+# with only the environment layer swapped (trinity/common/workflows/envs/UOPD/scienceworld/):
+#   - UOPD_scienceworld_workflow = the ALFWorld UOPD class (no UOPD code copied) on a ScienceWorld OPD base;
+#   - as UOPD: each turn's prompt is ONE user message holding the last 2 steps (no full conversation, no
+#     system prompt), the no-history template on the first turn only;
+#   - from TCOD's ScienceWorld workflows (TCOD/scienceworld/utils.py, as TCOD-b2f trains): the prompt
+#     templates (<think> tags, action commands + objects), the strict <action> parser, games loaded with
+#     simplification "easy", TCOD's train split (2294 games); reward = best score / 100, success = score 100.
+# What it does per training episode (as on ALFWorld):
+#   1. The Student proposes every action; the Teacher scores it (logprobs of the Student's tokens).
+#      Uncertainty = teacher confidence: mean -log p_teacher over the turn's tokens.
+#   2. A turn whose uncertainty is above an adaptive threshold tau is an intervention: the Teacher
+#      writes its own response from the same prompt and THAT action is executed in the game.
+#      tau is the (1 - r) quantile of the last 1000 turns' scores (a shared Ray actor), with the
+#      target rate r decaying linearly from 0.3 to 0.05 over 120 explore steps.
+#   3. Loss (policy_loss_fn uopd, trinity/trainer/tunix/logps.py:uopd_loss): Student turns get the
+#      OPD policy gradient -A * ratio (A = teacher - student logprob, no PPO clipping); intervention
+#      turns get SFT on the Teacher's tokens; one token-mean over both.
+# Same settings as the ALFWorld UOPD run: every workflow_args value (30 game steps), random task
+# selection (seed 42), 250 steps, batch 16 / 64 turns, lr 1e-6, kl_coef 1, staleness 2, 8 runners per
+# Student engine, Student prompts up to 2048 tokens (a CPU check over 30 games: max 790, mean 486).
+#
+# Storage (worker 0's disk is nearly full): every checkpoint (steps 50-250) and the run-dir buffer go to
+# worker 0 tmpfs, symlinked into the run dir by ~/tcod_runs/launch_sciworld_uopd.sh (lost if worker 0 reboots).
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Launch: ~/tcod_runs/launch_sciworld_uopd.sh (cluster bring-up, checks, tmpfs links).
+project: "SCIENCEWORLD_TCOD"
+name: "scienceworld_uopd_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+    lr_warmup_steps_ratio: 0.0
+  policy_loss_fn: uopd
+  policy_loss_fn_args:
+    loss_agg_mode: token-mean
+    sft_coef: 1.0
+    sft_mode: plain
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as our other runs.
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 2048  # as the ALFWorld UOPD run (one message per turn)
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 400  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: sciworld
+      storage_type: file
+      path: /home/haojun_shi/sci-data/tcod_tasks/train.jsonl  # TCOD's get_sciworld_data.py split (2294 games); on every worker
+      split: train
+      format:
+        prompt_key: 'task_desc'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:  # as the ALFWorld UOPD run (the release's, except max_env_steps)
+        max_env_steps: 30  # as our other runs (release: 50)
+        detect_uq: confidence
+        detect_uq_seed: 0
+        tau: 1.28
+        detect_temperature: 1.0
+        trigger_cap: null
+        sft_warmup_steps: 0
+        cold_start_takeover: false
+        tau_mode: quantile
+        rate_schedule: linear
+        r_start: 0.3
+        r_end: 0.05
+        r_decay_steps: 120
+        window_size: 1000
+        window_n_min: 300
+        teacher_sched: pipeline
+        teacher_takeover: true
+        temperature: 1.0
+      task_selector:
+        selector_type: random
+        seed: 42
+    default_workflow_type: 'UOPD_scienceworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: scienceworld_uopd_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      # Absolute path on node-local tmpfs (the dir must exist on every worker); see ftb_qwen3_30b_to_4b_tpu.yaml.
+      path: 'sqlite:////dev/shm/tcod_buffers/scienceworld_uopd_qwen3_30b_to_4b_tpu_buffer.db'
+
+explorer:
+  runner_per_model: 8  # as in the release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (release: 2 x tensor_parallel 2 GPUs)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as our other runs. Scores every Student turn
+    # and writes the response on intervention turns.
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (release: 1 x tensor_parallel 2 GPUs)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4 (fits; 321k-token KV cache)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384  # as the ALFWorld UOPD run; single-message prompts stay under ~1k tokens
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+  eval_on_startup: false
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250  # as in the release
+  save_interval: 50  # all on worker 0 tmpfs (see the header); release: 250
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

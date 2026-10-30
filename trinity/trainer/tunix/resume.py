@@ -69,7 +69,9 @@ def export_state(worker: Any, out_dir: str, expected_step: int, prune_others: bo
         os.makedirs(os.path.join(tmp, name), exist_ok=True)
         for i, leaf in enumerate(_leaves(tree)):
             arr = np.asarray(jax.device_get(leaf))
-            np.save(os.path.join(tmp, name, f"{i}.npy"), arr)
+            # bf16 leaves (Gemma 4's frozen per-layer table): .npy has no bfloat16, store the bits
+            np.save(os.path.join(tmp, name, f"{i}.npy"),
+                    arr.view(np.uint16) if str(arr.dtype) == "bfloat16" else arr)
             meta[name].append([list(arr.shape), str(arr.dtype)])
     meta["seconds"] = round(time.time() - t0, 1)
     with open(os.path.join(tmp, "meta.json"), "w") as f:
@@ -108,6 +110,10 @@ def load_state(worker: Any, in_dir: str) -> int:
         new = []
         for i, leaf in enumerate(leaves):
             arr = np.load(os.path.join(in_dir, name, f"{i}.npy"))
+            if meta[name][i][1] == "bfloat16":
+                import ml_dtypes
+
+                arr = arr.view(ml_dtypes.bfloat16)
             if tuple(arr.shape) != tuple(leaf.shape) or str(arr.dtype) != str(leaf.dtype):
                 raise ValueError(f"{name}[{i}]: saved {arr.shape} {arr.dtype}, worker {leaf.shape} {leaf.dtype}")
             sharding = getattr(leaf, "sharding", None)

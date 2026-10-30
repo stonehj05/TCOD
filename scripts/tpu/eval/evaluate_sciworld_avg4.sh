@@ -11,9 +11,9 @@
 # parts = one wave of 16 jobs). Part files go to $OUT_ROOT (default $REPO/checkpoints/eval_runs,
 # the NFS share); the model path must be readable from every worker.
 #
-# EVAL_TEMPLATE=tcod / ftb_release: TCOD-b2f's / FutureBridge-OPD's own prompts (client --template;
+# EVAL_TEMPLATE=tcod / ftb_release / uopd: TCOD-b2f's / FutureBridge-OPD's / UOPD's own prompts (client --template;
 # default: DASH-OPD's).
-# Usage: [EVAL_TEMPLATE=tcod|ftb_release] evaluate_sciworld_avg4.sh MODEL_PATH LABEL
+# Usage: [EVAL_TEMPLATE=tcod|ftb_release|uopd] evaluate_sciworld_avg4.sh MODEL_PATH LABEL
 set -uo pipefail
 MODEL_PATH=$1
 LABEL=$2

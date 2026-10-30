@@ -40,10 +40,37 @@ def set_tpu_metrics_port() -> None:
     ).strip()
 
 
+
+def _text_only_args(model_path: str) -> dict:
+    """Gemma 4 checkpoints carry vision / audio towers; our games are text-only, so serve without
+    them (as tested on TPU v4, 2026-10-26). Empty for every other model."""
+    import json
+    import os
+
+    cfg = os.path.join(model_path, "config.json")
+    if os.path.isfile(cfg):
+        with open(cfg) as f:
+            if json.load(f).get("architectures", [""])[0].startswith("Gemma4"):
+                return {"limit_mm_per_prompt": {"image": 0, "audio": 0}}
+    return {}
+
 class vLLMTPURolloutModel(vLLMRolloutModel):
     def __init__(self, config: InferenceModelConfig) -> None:
         BaseInferenceModel.__init__(self, config)  # skip the CUDA-specific engine setup
         set_tpu_metrics_port()
+        # Gemma 4 MoE (26B-A4B): vLLM model path + gmm_v2 tile patch (tpu_env.moe_env_vars). Resolved here, on
+        # the engine's own host (the driver's host may hold no copy of the weights). The env reaches a spawned
+        # engine core (PYTHONPATH -> sitecustomize); the in-process import covers a forked one.
+        from trinity.common.models.tpu_env import moe_env_vars
+
+        moe_env = moe_env_vars(config.model_path)
+        if moe_env:
+            import importlib.util
+
+            os.environ.update(moe_env)
+            site = os.path.join(moe_env["PYTHONPATH"].split(":")[0], "sitecustomize.py")
+            spec = importlib.util.spec_from_file_location("tpu_moe_sitecustomize", site)
+            spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
         import vllm
         from vllm.sampling_params import RequestOutputKind
@@ -95,6 +122,7 @@ class vLLMTPURolloutModel(vLLMRolloutModel):
             enable_log_requests=config.enable_log_requests,
             reasoning_parser=config.reasoning_parser,
             async_scheduling=False,
+            **_text_only_args(config.model_path),
         )
         self.async_llm = vllm.AsyncLLMEngine.from_engine_args(engine_args)
         self.processor = None
@@ -149,6 +177,18 @@ class vLLMTPURolloutModel(vLLMRolloutModel):
         self.logger.info(f"Loaded {n} tensors from {checkpoint_dir} (model version {version}).")
         self.model_version = model_version
         return model_version
+
+    async def prompt_token_ids(self, messages, add_generation_prompt: bool = True):
+        """`messages` rendered with this engine's chat template and thinking setting, as token ids (used by
+        the deferred teacher gate to compare the teacher's generation prompt with the student's)."""
+        if self.tokenizer is None:
+            await self._initialize_tokenizer()
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=add_generation_prompt,
+            chat_template=self.chat_template or self.tokenizer.get_chat_template(),
+            enable_thinking=self.enable_thinking,
+        )
+        return self.tokenizer(text, add_special_tokens=False)["input_ids"]
 
     async def init_process_group(self, *args, **kwargs):
         raise NotImplementedError("NCCL weight sync is not available on TPU; use sync_method: checkpoint.")

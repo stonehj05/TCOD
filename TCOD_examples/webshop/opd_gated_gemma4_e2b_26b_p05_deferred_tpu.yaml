@@ -1,0 +1,194 @@
+# Our WebShop method on Gemma 4 with a MoE teacher (user, 2026-10-27): student gemma-4-E2B-it -> teacher
+# gemma-4-26B-A4B-it (4B active parameters; the 31B dense teacher made a step ~6.5 min). Identical to
+# opd_gated_gemma4_e2b_31b_p05_deferred_tpu.yaml (the run name aside) except the teacher. The 26B-A4B serves on
+# v4 only through vLLM-TPU's vLLM model path with a gmm_v2 tile patch (trinity/common/models/tpu_env.py
+# moe_env_vars, applied automatically for Gemma 4 MoE engines; tested 2026-10-27: ~2x the 31B's throughput,
+# KV cache 136k tokens at 0.8, log-probs as close to HF fp32 as HF's own bf16 run).
+#
+# The 31B config's description:
+#   Our WebShop method on a SECOND MODEL FAMILY (user, 2026-10-26): Gemma 4, student gemma-4-E2B-it -> teacher
+#   gemma-4-31B-it (the user's option 1; Gemma 4 26B-A4B / E4B do not run on our v4 stack, see
+#   trinity/trainer/tunix/gemma4.py). Everything is the p05 run's (opd_gated_student_teacher_lookahead_t07_s03_
+#   dashtpl_p05_deferred_tpu.yaml: DASH-OPD's prompts, full conversation, 15 steps, the 0.7/0.3 gate with
+#   progress_score 0.5, task / experience shuffle seed 42, 150 steps, a checkpoint every 25) except:
+#     - the models, and thinking off through the same `enable_thinking` chat-template switch (Gemma 4 has one);
+#     - the student's per-layer embedding table is frozen (user, 2026-10-26; bf16, no update): E2B does not
+#       fit a 4-chip v4 trainer otherwise. All other student weights are trained as for Qwen;
+#     - trainer flash-attention block 256 (set automatically for Gemma 4; 512 overflows v4 VMEM);
+#     - TPU roles: teachers on workers 1 and 3, the 4 students (and the WebShop servers) on worker 2, because
+#       worker 2's tmpfs cannot hold the 59 GB teacher (see ~/tcod_runs/launch_webshop_gemma4.sh).
+#   Each model keeps its own chat template: the student's turns use E2B's, the teacher scores those tokens as
+#   they are (standard OPD), and its own questions / look-aheads use the 31B's.
+#
+# The p05 run's description:
+# Gated OPD on WebShop with a partial-credit outcome: as
+# opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu.yaml (every other value unchanged), except
+# progress_score: 0.5 -- in the gate's outcome checks (a teacher look-ahead that buys inside its window; the
+# student's final window) a purchase scoring >= 0.5 counts as progress, instead of only a perfect 1. That run's
+# rule labelled ~76% of the teacher's purchases "no progress" (user, 2026-10-22: "use simpler 0.5 bound").
+# The teacher look-ahead itself is unchanged.
+#
+# Base run's description:
+# Gated OPD on WebShop: the method of our ScienceWorld / ALFWorld runs,
+# TCOD_examples/scienceworld/opd_gated_student_teacher_lookahead_t07_s03_dashtpl_deferred_tpu.yaml
+# (disagreement + student look-ahead + teacher look-ahead; weights 1.0 / 0.7 / 0.3 / 0.0; deferred to the
+# trainer), with the game swapped. Every value is that run's except the game:
+#   - taskset: TCOD's WebShop data (TCOD_examples/webshop/get_webshop_data.py, unchanged; identical to
+#     DASH-OPD's): session ids 0-4095 train, 4096-4195 test, on WebShop's full product set (1.18M products,
+#     human goals; the 1000-product set has only 13 goals). prompt_key task_id = the session id.
+#   - workflow: OPD_gated_webshop_workflow_student_teacher_lookahead (TCOD's WebShop rollout with DASH-OPD's
+#     WebShop prompts: no history summary in turns 1-3, the last 2 observation-action pairs from turn 4,
+#     full conversation; reward = the purchase's score, 0 without one; "completed" = score 1 for the gate's
+#     outcome checks). The same prompts in the teacher's look-ahead and in eval.
+#     Games run on shared WebShop servers (webshop/env_server.py: 4 actors, each on the node of the runner
+#     that first needs it; one catalog each, ~20 GB) instead of one per env (TCOD: ~1 TB of memory).
+#     Training metrics per explore step: rollout/env_score/mean, rollout/env_success/mean.
+#   - TCOD's WebShop settings (TCOD_examples/webshop/opd.yaml, tcod_b2f.yaml): 15 game steps, 150 training
+#     steps. Look-ahead window 5 as on the other games.
+# The other training hyperparameters are TCOD's (the same in its WebShop configs): lr 1e-6, batch 16 games /
+# 64 turns, staleness 2, kl_coef 1, 10240 / 512 tokens, temperature 1.0. As DASH-OPD's WebShop configs (and
+# the paper's App. M, seed 42 for every stochastic component): training sessions shuffled (seed 42) and
+# each experience batch shuffled (seed 42); the first run (2026-10-20, deleted) used neither.
+# Not as TCOD's WebShop configs: the Student / Teacher (ours: plain Qwen3-4B / Qwen3-30B-A3B; TCOD:
+# Qwen2.5-3B-Instruct / unspecified), the TPU layout, a checkpoint every 25 steps, and no in-training eval
+# (TCOD: 10 random test sessions every 5 steps); evaluated afterwards on the 100 test sessions, avg@4,
+# with DASH-OPD's prompts (temperature 0.4, max_tokens 4096, 15 steps = DASH-OPD's WebShop benchmark).
+#
+# Needs on EVERY worker (done 2026-10-20): WebShop's code at ~/webshop (github.com/princeton-nlp/WebShop
+# 64fa2a5, web_agent_site/utils.py pointed at the full items_shuffle.json / items_ins_v2.json) on the
+# venv's path, its data and search index on tmpfs (/dev/shm/webshop_data; from the Hugging Face mirror
+# YWZBrandon/webshop-data, same files as WebShop's Google Drive), and gym 0.24, pyserini 0.17, faiss-cpu,
+# rank_bm25, thefuzz, cleantext, beautifulsoup4, en_core_web_sm in ~/venv-vllm-tpu; Java 17.
+#
+# TPU layout and launch as the ScienceWorld run: ~/tcod_runs/launch_webshop_ours_p05.sh
+project: "WEBSHOP_TCOD"
+name: "webshop_gemma4_e2b_26b_opd_gated_p05_deferred_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+# Mechanism: trinity/common/workflows/envs/TCOD/webshop/OPD_gated_workflow_student_teacher_lookahead.py
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: Gemma 4 E2B (instruction-tuned), tmpfs copy on every worker.
+  model_path: /dev/shm/models/gemma-4-E2B-it
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's get_webshop_data.py (4096 train sessions); on every worker
+      split: train
+      task_selector:  # DASH-OPD's WebShop configs (paper App. M: seed 42 everywhere); 150 x 16 < 4096: one epoch
+        selector_type: shuffle
+        seed: 42
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0  # as TCOD's WebShop configs (the workflow default)
+        max_env_steps: 15  # TCOD's WebShop configs
+        # Teacher look-ahead: how many steps the teacher plays from a step it disagrees with,
+        # and how it decodes them.
+        progress_window_size: 5
+        teacher_rollout_temperature: 0.0
+        teacher_rollout_max_tokens: 512
+        # Decoding for the progress judgment of the teacher's own steps.
+        progress_temperature: 0.0
+        progress_max_tokens: 512
+        # Decoding for the agreement (yes/no) check -- same as opd_gated_fullmemory.yaml.
+        consistency_temperature: 0.0
+        consistency_max_tokens: 512
+        # Weight of a step the teacher disagrees with, by its judgment of its own steps.
+        # S = student not making progress, T = teacher making progress
+        both_weight: 1.0
+        teacher_only_weight: 0.7
+        student_only_weight: 0.3
+        neither_weight: 0.0
+        # Outcome checks: a purchase scoring >= this counts as progress (default 1.0 = only a perfect one).
+        progress_score: 0.5
+        # The trainer gates and scores the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+        # true: do not score turns whose weight is 0 (training is identical; see teacher_gate.py)
+        skip_zero_weight_scoring: false
+    default_workflow_type: 'OPD_gated_webshop_workflow_student_teacher_lookahead'
+  trainer_input:
+    experience_buffer:
+      name: webshop_gemma4_e2b_26b_opd_gated_p05_deferred_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true  # DASH-OPD's WebShop configs
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_gemma4_e2b_26b_opd_gated_p05_deferred_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: Gemma 4 26B-A4B (MoE, instruction-tuned); TP4 tested on v4: KV cache 136k tokens at 0.8.
+    - model_path: /dev/shm/models/gemma-4-26B-A4B-it  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 150  # TCOD's WebShop configs
+  save_interval: 25  # user, 2026-10-21; last three = 100 / 125 / 150
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

@@ -1,0 +1,169 @@
+# UOPD on WebShop with FULL MEMORY (user, 2026-10-23: "rerun it with full memory"): uopd_qwen3_30b_to_4b_tpu.yaml
+# (the release's config on our WebShop) with two changes only:
+#   - workflow_args.full_memory: true -- each turn's UOPD message (same template, last 2 observation-action pairs)
+#     is appended to the whole conversation, every earlier user message and executed response kept (the
+#     Teacher's on a taken-over turn), as TCOD's / FutureBridge's WebShop rollouts do. The release: one message.
+#   - student max_prompt_tokens 10240 (release 4096; our other full-memory WebShop runs: 10240): an over-long
+#     turn is masked out (the Student's, and a taken-over one with it, UOPD_workflow._mask_overlong_trigger_row).
+# Launch: ~/tcod_runs/launch_webshop_uopd_fullmemory.sh. Original header follows.
+#
+# UOPD, "Uncertainty-Aware Intervention for On-Policy Distillation of Multi-Turn Agents"
+# (https://github.com/onepounchman/UOPD, commit 61f90c5) on WebShop, with OUR student / teacher: plain
+# Qwen3-4B / plain Qwen3-30B-A3B. Every value is the release's configs/webshop/3b/uopd.yaml (user,
+# 2026-10-22: "keep everything the same as their original config"), except:
+#   - the shop (user, 2026-10-22: "our env, UOPD algo"): the WebShop of our other WebShop runs -- WebShop's
+#     full product set (1.18M products), human goals, TCOD's training sessions 0-4095 (prompt_key task_id =
+#     the session id), on our shared WebShop servers (TCOD/webshop/env_server.py). The release plays the
+#     1000-product set with synthetic goals (verl-agent/GiGPO's env) on its own task ids 500-6909.
+#     UOPD's plain `text` observations are kept (our other runs: `text_rich`).
+#   - the models (release: Qwen2.5-3B-Instruct student, GiGPO-Qwen2.5-7B-Instruct-WebShop teacher), the
+#     TPU layout, and no in-training eval (release: 10 test_pool tasks every 5 steps); evaluated afterwards
+#     on TCOD's 100 test sessions, avg@4.
+# The workflow is the release's (trinity/common/workflows/envs/UOPD/webshop/: UOPD_workflow.py unchanged;
+# OPD_workflow.py with only the env calls awaited and the registered name changed; utils.py with only
+# _create_webshop_env swapped): each turn's prompt is ONE user message (UOPD's <think> template, the last
+# 2 observation-action pairs, no-history template while fewer than 2 steps were taken), 15 game steps,
+# reward = the purchase's score.
+# What it does per training episode (as on ALFWorld / ScienceWorld):
+#   1. The Student proposes every action; the Teacher scores it (logprobs of the Student's tokens).
+#      Uncertainty = teacher confidence: mean -log p_teacher over the turn's tokens.
+#   2. A turn whose uncertainty is above an adaptive threshold tau is an intervention: the Teacher
+#      writes its own response from the same prompt and THAT action is executed in the game.
+#      tau is the (1 - r) quantile of the last 1000 turns' scores (a shared Ray actor), with the
+#      target rate r decaying linearly from 0.3 to 0.05 over 75 explore steps (WebShop release).
+#   3. Loss (policy_loss_fn uopd, trinity/trainer/tunix/logps.py:uopd_loss): Student turns get the
+#      OPD policy gradient -A * ratio (A = teacher - student logprob, no PPO clipping); intervention
+#      turns get SFT on the Teacher's tokens; one token-mean over both.
+#
+# Storage: every checkpoint (steps 50 / 100 / 150) and the run-dir buffer go to worker 0 tmpfs, symlinked
+# into the run dir by ~/tcod_runs/launch_webshop_uopd_fullmemory.sh (lost if worker 0 reboots).
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Launch: ~/tcod_runs/launch_webshop_uopd_fullmemory.sh (cluster bring-up, checks, tmpfs links).
+project: "WEBSHOP_TCOD"
+name: "webshop_uopd_fullmemory_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+  policy_loss_fn: uopd
+  policy_loss_fn_args:
+    loss_agg_mode: token-mean
+    sft_coef: 1.0
+    sft_mode: plain
+
+model:
+  # Student model: plain Qwen/Qwen3-4B -- same as our other runs (release: Qwen2.5-3B-Instruct).
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240  # full memory (release 4096, one message per turn)
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (release: 150); the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's 4096 train sessions (our env); on every worker
+      split: train
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:  # release
+        temperature: 1.0
+        max_env_steps: 15
+        full_memory: true  # TPU port (user, 2026-10-23); release: one message per turn
+        detect_uq: confidence
+        detect_uq_seed: 0
+        tau: 1.0
+        detect_temperature: 1.0
+        trigger_cap: null
+        sft_warmup_steps: 0
+        cold_start_takeover: false
+        tau_mode: quantile
+        rate_schedule: linear
+        r_start: 0.3
+        r_end: 0.05
+        r_decay_steps: 75
+        window_size: 1000
+        window_n_min: 300
+        teacher_sched: pipeline
+        teacher_takeover: true
+      task_selector:  # release: sessions in order from 0
+        selector_type: sequential
+        seed: 42
+    default_workflow_type: 'UOPD_webshop_workflow'
+  trainer_input:
+    experience_buffer:
+      name: webshop_uopd_fullmemory_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      # Absolute path on node-local tmpfs (the dir must exist on every worker)
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_uopd_fullmemory_qwen3_30b_to_4b_tpu_buffer.db'
+
+explorer:
+  runner_per_model: 8  # release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (release: 2 x tensor_parallel 2 GPUs)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B -- same as our other runs (release:
+    # langfeng01/GiGPO-Qwen2.5-7B-Instruct-WebShop). Scores every Student turn and writes the
+    # response on intervention turns.
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (release: 1 x tensor_parallel 2 GPUs)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384  # release
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+  eval_on_startup: false
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 150  # release
+  save_interval: 50  # release
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

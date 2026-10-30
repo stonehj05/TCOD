@@ -26,11 +26,17 @@ PY=$VENV/bin/python VLLM=$VENV/bin/vllm
 PORT=$(( 8081 + CHIP )) TPU_PORT=$(( 8477 + CHIP ))
 LOG=/dev/shm/vllm_evaljob_chip${CHIP}.log
 
+# Gemma 4 checkpoints carry vision / audio towers: serve text-only, as run_webshop_eval_job*.sh (empty for every
+# other model, so Qwen evals are unchanged)
+MM_ARGS=()
+$PY -c "import json,sys; sys.exit(0 if json.load(open('$MODEL_PATH/config.json'))['architectures'][0].startswith('Gemma4') else 1)" 2>/dev/null \
+    && MM_ARGS=(--limit-mm-per-prompt '{"image":0,"audio":0}')
+
 start_server() {  # $1: extra LIBTPU_INIT_ARGS
     TPU_VISIBLE_CHIPS=$CHIP TPU_CHIPS_PER_PROCESS_BOUNDS=1,1,1 TPU_PROCESS_BOUNDS=1,1,1 \
     TPU_PROCESS_PORT=$TPU_PORT TPU_PROCESS_ADDRESSES=localhost:$TPU_PORT LIBTPU_INIT_ARGS="$1" \
         nohup $VLLM serve "$MODEL_PATH" --port "$PORT" --served-model-name "$SERVED_NAME" \
-        --tensor-parallel-size 1 --gpu-memory-utilization "$GPU_MEM_UTIL" --max-model-len "$MAX_MODEL_LEN" \
+        --tensor-parallel-size 1 --gpu-memory-utilization "$GPU_MEM_UTIL" --max-model-len "$MAX_MODEL_LEN" "${MM_ARGS[@]}" \
         > "$LOG" 2>&1 &
     PID=$!
     for i in $(seq 1 90); do

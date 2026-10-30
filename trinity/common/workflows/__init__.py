@@ -3,6 +3,10 @@
 from trinity.common.workflows.workflow import Task, Workflow
 from trinity.utils.registry import Registry
 
+from trinity.common.workflows.envs import downward_pool
+
+downward_pool.install()  # ALFWorld: reuse fast_downward library copies (tmpfs leak)
+
 WORKFLOWS: Registry = Registry(
     "workflows",
     default_mapping={
@@ -73,9 +77,23 @@ WORKFLOWS: Registry = Registry(
         "UOPD_alfworld_workflow": "trinity.common.workflows.envs.UOPD.alfworld.UOPD_workflow.UOPDAlfworldWorkflow",
         "UOPD_OPD_alfworld_workflow": "trinity.common.workflows.envs.UOPD.alfworld.OPD_workflow.OnPolicyDistillVerlAgentAlfworldWorkflow",
         "UOPD_eval_alfworld_workflow": "trinity.common.workflows.envs.UOPD.alfworld.eval_workflow.EvalAlfworldWorkflow",
+        # UOPD on ScienceWorld (not in the release): its ALFWorld algorithm with TCOD's ScienceWorld prompts
+        "UOPD_scienceworld_workflow": "trinity.common.workflows.envs.UOPD.scienceworld.UOPD_workflow.UOPDScienceWorldWorkflow",
+        "UOPD_OPD_scienceworld_workflow": "trinity.common.workflows.envs.UOPD.scienceworld.OPD_workflow.OnPolicyDistillScienceWorldWorkflow",
+        # UOPD on WebShop: the release's workflows, on our WebShop servers (full catalog, human goals)
+        "UOPD_webshop_workflow": "trinity.common.workflows.envs.UOPD.webshop.UOPD_workflow.UOPDWebshopWorkflow",
+        "UOPD_OPD_webshop_workflow": "trinity.common.workflows.envs.UOPD.webshop.OPD_workflow.OnPolicyDistillVerlAgentWebshopWorkflow",
+        # DASH-OPD (github.com/Lucian1115/DASH-OPD) ScienceWorld vanilla OPD, copied unchanged
+        "DASH_repo_OPD_scienceworld_workflow": "trinity.common.workflows.envs.DASH.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",
         "TCOD_b2f_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow.TCOD_b2f_alfworld_workflow",
         "OPD_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",
-        "OPD_gated_scienceworld_workflow_student_teacher_lookahead": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_gated_workflow_student_teacher_lookahead.OPDGatedScienceworldWorkflowStudentTeacherLookahead",
+        "OPD_scienceworld_workflow_dashtpl": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow_dashtpl.OnPolicyDistillScienceworldWorkflowDashTpl",
+        "OPD_gated_scienceworld_workflow_student_teacher_lookahead":"trinity.common.workflows.envs.TCOD.scienceworld.OPD_gated_workflow_student_teacher_lookahead.OPDGatedScienceworldWorkflowStudentTeacherLookahead",
+        "OPD_gated_webshop_workflow_student_teacher_lookahead":"trinity.common.workflows.envs.TCOD.webshop.OPD_gated_workflow_student_teacher_lookahead.OPDGatedWebshopWorkflowStudentTeacherLookahead",
+        "OPD_gated_alfworld_workflow_disagree_only": "trinity.common.workflows.envs.TCOD.alfworld.OPD_gated_workflow_disagree_only.OPDGatedAlfworldWorkflowDisagreeOnly",
+        "OPD_gated_scienceworld_workflow_disagree_only":"trinity.common.workflows.envs.TCOD.scienceworld.OPD_gated_workflow_disagree_only.OPDGatedScienceworldWorkflowDisagreeOnly",
+        "OPD_gated_webshop_workflow_disagree_only":"trinity.common.workflows.envs.TCOD.webshop.OPD_gated_workflow_disagree_only.OPDGatedWebshopWorkflowDisagreeOnly",
+        "OPD_webshop_workflow_dashtpl":"trinity.common.workflows.envs.TCOD.webshop.OPD_workflow_dashtpl.OnPolicyDistillWebshopWorkflowDashTpl",
         "TCOD_f2b_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.TCOD_f2b_workflow.TCOD_f2b_scienceworld_workflow",
         "TCOD_b2f_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.TCOD_b2f_workflow.TCOD_b2f_scienceworld_workflow",
         # FutureBridge-OPD (github.com/ChenChiShui/FutureBridge-OPD), ScienceWorld; ported as released

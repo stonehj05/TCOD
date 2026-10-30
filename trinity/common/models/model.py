@@ -125,6 +125,19 @@ class BaseInferenceModel(InferenceModel):
             )
         return prompt
 
+    def _truncate_prompt_keep_recent(self, prompt: str) -> Tuple[List[int], Optional[str]]:
+        """DASH-OPD's prompt truncation (config.prompt_truncation_keep_recent): keep the last
+        max_prompt_tokens tokens and still generate. Returns the token ids and the truncate status."""
+        token_ids = self.tokenizer(prompt, truncation=False, return_tensors="pt")["input_ids"][0].tolist()
+        if (
+            self.config.enable_prompt_truncation
+            and self.config.max_prompt_tokens is not None
+            and len(token_ids) > self.config.max_prompt_tokens
+        ):
+            self.logger.warning(f"Prompt was left-truncated to {self.config.max_prompt_tokens} tokens")
+            return token_ids[-self.config.max_prompt_tokens :], "prompt_truncated"
+        return token_ids, None
+
     def _handle_prompt_truncation(self, prompt: str, **kwargs) -> Tuple[Sequence, bool]:
         """Handle prompt truncation if needed."""
         # Tokenize once without truncation to check if truncation is needed

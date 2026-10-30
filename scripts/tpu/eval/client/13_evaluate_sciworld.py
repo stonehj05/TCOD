@@ -23,6 +23,11 @@ workflows, ftb_release_utils.py): TCOD's ScienceWorld template with mandatory <t
 action parser (with its fallback for responses without <action> tags), and games loaded with no
 simplification; full conversation, no system prompt, as it trains.
 
+--template uopd: UOPD's rollout as ported to ScienceWorld (UOPD/scienceworld/OPD_workflow.py, as the
+UOPD run trains): TCOD's ScienceWorld template and parser (utils.py, simplification "easy"), but ONE user
+message per turn holding the last 2 steps (no conversation memory), the no-history template on the
+first turn only.
+
 Run one job per chip and avg@4 with ../evaluate_sciworld_avg4.sh.
 """
 
@@ -46,6 +51,9 @@ from trinity.common.workflows.envs.TCOD.scienceworld.OPD_gated_workflow_student_
     build_user_content,
 )
 from trinity.common.workflows.envs.TCOD.scienceworld import ftb_release_utils as fr  # noqa: E402
+from trinity.common.workflows.envs.UOPD.scienceworld.OPD_workflow import (  # noqa: E402
+    build_user_content as uopd_user_content,
+)
 
 SPLIT = "test"
 
@@ -71,7 +79,9 @@ def tcod_user_content(m):
 
 # --template: (prompt builder, env/parser helpers)
 TEMPLATES = {"dash": (build_user_content, sw), "tcod": (tcod_user_content(sw), sw),
-             "ftb_release": (tcod_user_content(fr), fr)}
+             "ftb_release": (tcod_user_content(fr), fr), "uopd": (uopd_user_content, sw)}
+# Templates whose prompt is the turn's message alone (the last steps are inside it), not the conversation.
+SINGLE_MESSAGE = {"uopd"}
 
 
 def _load_tasks(path: str, start: Optional[int], end: Optional[int]) -> List[dict]:
@@ -95,7 +105,7 @@ def run_episode(env, model_client, max_steps: int, mock: bool, template: str = "
     rounds, done, overflow = max_steps, False, False
     for r in range(max_steps):
         user_content, format_obs = build_user_content(env, observation, history, task_description, r)
-        memory = memory + [{"role": "user", "content": user_content}]
+        memory = ([] if template in SINGLE_MESSAGE else memory) + [{"role": "user", "content": user_content}]
         avail = {"commands": env.get_valid_action_object_combinations()} if mock else None
         try:
             text, raw = model_client.chat(memory, available_actions=avail)

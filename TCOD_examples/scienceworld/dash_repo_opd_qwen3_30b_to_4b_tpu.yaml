@@ -1,0 +1,146 @@
+# Vanilla OPD on ScienceWorld as DASH-OPD runs it: github.com/Lucian1115/DASH-OPD (commit dc0aa86),
+# configurations/scienceworld/opd.yaml, ported to Cloud TPU. Changes are only those the TPU / this machine need;
+# everything else is DASH-OPD's file as is.
+#
+# Workflow: DASH_repo_OPD_scienceworld_workflow = DASH-OPD's OPD_scienceworld_workflow copied unchanged
+# (trinity/common/workflows/envs/DASH/): DASH-OPD's prompts, full chat history, a 2-step history line after
+# the first initial_no_history_turns turns, reward = best score / 100; the teacher scores every student turn in
+# the explorer (no deferred scoring, no gate), full weight.
+# DASH-OPD framework changes this config relies on, ported as opt-in switches (off by default):
+#   rollout_model.prompt_truncation_keep_recent  over-long prompts keep their last 10240 tokens and are still
+#                                                generated from and trained on (TCOD: fake 1-token response, masked)
+#   task_selector.reshuffle_each_epoch           a new task permutation each epoch (TCOD's repeats epoch 0's)
+#   experience_buffer.shuffle_experiences        each rollout batch is shuffled (seed 42) before the trainer reads it
+#
+# Not as in DASH-OPD:
+#   - student Qwen/Qwen3-4B (the file names Qwen3-1.7B; the paper runs the same configs with 1.7B and 4B);
+#     teacher: tmpfs copy of plain Qwen3-30B-A3B (same model)
+#   - TPU backends (vllm_tpu, tunix trainer), engine layout (4 students x TP1, 2 teachers x TP4; DASH: 2 x TP2,
+#     1 x TP2), sync by checkpoint instead of NCCL; verl-only trainer keys (use_dynamic_bsz,
+#     max_token_len_per_gpu, ulysses) dropped
+#   - checkpoint every 50 steps (DASH: final only) so the last three can be evaluated
+#   - no in-training eval (DASH also has enable_training_eval: false); its eval taskset, post-training benchmark
+#     (lifecycle) and launcher-only keys (enable_name_conflict_check, eval_step_offset, eval_on_startup,
+#     training_rollout_sample_interval) dropped; evaluated afterwards with scripts/tpu/eval
+#   - rollout_args min_p: 0.0 dropped (= disabled, vLLM's default; our config has no such key)
+#   - paths (data from TCOD's get_sciworld_data.py split, identical to DASH-OPD's script); buffer on tmpfs;
+#     project SCIENCEWORLD_TCOD (DASH: SCIENCEWORLD) to keep our checkpoint layout; tensorboard instead of wandb
+#   - buffer.total_steps 3000: explorer upper bound only, the run ends on trainer.total_steps 250 (as our other runs)
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4 students.
+# Launch: ~/tcod_runs/launch_sciworld_dash_repo_opd.sh.
+
+project: "SCIENCEWORLD_TCOD"
+name: "scienceworld_dash_repo_opd_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  loss_agg_mode: "token-mean"
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: sciworld
+      storage_type: file
+      path: /home/haojun_shi/sci-data/tcod_tasks/train.jsonl  # TCOD's get_sciworld_data.py split (2294 games); on every worker
+      split: train
+      task_selector:
+        selector_type: shuffle
+        seed: 42
+        reshuffle_each_epoch: true  # DASH-OPD's ShuffleSelector
+      format:
+        prompt_key: 'task_desc'
+      rollout_args:
+        temperature: 1.0
+        max_tokens: 512
+        top_p: 1.0
+        top_k: -1
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 30
+        history_length: 2
+        initial_no_history_turns: 3
+        include_think_in_history: false
+        retain_full_chat_history: true
+    default_workflow_type: 'DASH_repo_OPD_scienceworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: scienceworld_dash_repo_opd_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/scienceworld_dash_repo_opd_qwen3_30b_to_4b_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  runner_per_model: 8
+  # (DASH-OPD) Keep a stuck rollout below the trainer queue's 1800 s read timeout so one
+  # wedged teacher-logprob request cannot terminate the whole training run.
+  max_timeout: 900
+  max_retry_times: 0
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (DASH: 2 x TP2)
+    tensor_parallel_size: 1
+    prompt_truncation_keep_recent: true  # DASH-OPD's prompt truncation
+    enable_prefix_caching: true
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (DASH: 1 x TP2)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: true
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 10752
+      max_prompt_tokens: 10240
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250
+  save_interval: 50  # DASH: 250 (final only)
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

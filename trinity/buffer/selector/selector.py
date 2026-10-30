@@ -1,5 +1,5 @@
 """Data selectors."""
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -122,19 +122,35 @@ class ShuffleSelector(BaseSelector):
         self.dataset_size = data_source.dataset_size  # Total available samples
         self.current_index = 0  # Progress tracker
         self.seed = config.seed  # For reproducible shuffling
+        self.reshuffle_each_epoch = config.reshuffle_each_epoch
+        self.orders_epoch = 0
         self.orders = self._get_orders()  # Current shuffled index order
 
-    def _get_orders(self) -> List[int]:
+    def _get_orders(self, epoch: Optional[int] = None) -> List[int]:
         """
         Generate a new shuffled order for the current epoch.
 
         Uses NumPy's PCG64 random generator seeded by epoch number for reproducibility.
         Ensures different shuffle per epoch while being deterministic if seed is fixed.
         """
-        rng = np.random.default_rng(self.seed + self.current_index // self.dataset_size)
+        if epoch is None:
+            epoch = self.current_index // self.dataset_size
+        rng = np.random.default_rng(self.seed + epoch)
         return rng.permutation(self.dataset_size).tolist()
 
     def get_indices(self, batch_size: int, return_extra_info: bool = False) -> List[int]:
+        if self.reshuffle_each_epoch:
+            # DASH-OPD's version: the permutation of each epoch is seeded by that epoch's number
+            ret = []
+            while len(ret) < batch_size:
+                epoch, start = divmod(self.current_index, self.dataset_size)
+                if epoch != self.orders_epoch:
+                    self.orders_epoch = epoch
+                    self.orders = self._get_orders(epoch)
+                take = min(batch_size - len(ret), self.dataset_size - start)
+                ret.extend(self.orders[start : start + take])
+                self.current_index += take
+            return ret
         start = self.current_index % self.dataset_size
         end = start + batch_size
         if end <= self.dataset_size:
@@ -161,7 +177,8 @@ class ShuffleSelector(BaseSelector):
 
     def load_state_dict(self, state_dict):
         self.current_index = state_dict.get("current_index", 0)
-        self.orders = self._get_orders()
+        self.orders_epoch = self.current_index // self.dataset_size
+        self.orders = self._get_orders(self.orders_epoch if self.reshuffle_each_epoch else None)
 
 
 class RandomSelector(BaseSelector):

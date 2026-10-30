@@ -1,0 +1,118 @@
+# Vanilla OPD on ALFWorld with Gemma 4 (user, 2026-10-29: "try vanilla OPD with Gemma on alfworld"), to see whether
+# distilling gemma-4-E2B-it from gemma-4-26B-A4B-it fails on ALFWorld too (on WebShop neither vanilla OPD nor our gate
+# beat the untrained E2B). Our ALFWorld method's config (opd_gated_student_teacher_lookahead_t07_s03_deferred_tpu.yaml:
+# full memory, 30 env steps, 250 steps, a checkpoint every 50, no task shuffle) with
+#   - the gate removed as the Qwen vanilla run removes it (opd_fullmemory_deferred_tpu.yaml): workflow
+#     OPD_alfworld_workflow_fullmemory (the same rollout, prompts and memory as the gated workflow; every turn weight 1),
+#     the gate's workflow_args dropped;
+#   - the models swapped as on WebShop: student gemma-4-E2B-it (per-layer embedding table frozen, flash block 256, both
+#     automatic for Gemma 4), teacher gemma-4-26B-A4B-it (MoE serving recipe applied automatically, tpu_env.moe_env_vars),
+#     thinking off for both; the teacher scores with its own empty thought block (teacher_gate._teacher_marker);
+#   - TPU roles as the Gemma WebShop runs: worker 0 trainer, workers 1 and 3 teachers, worker 2 the 4 students.
+project: "ALFWORLD_TCOD"
+name: "alfworld_gemma4_e2b_26b_opd_fullmemory_deferred_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for every checkpoint) is used
+
+# Mechanism: trinity/common/workflows/envs/TCOD/alfworld/OPD_workflow_fullmemory.py (vanilla OPD, full memory)
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: Gemma 4 E2B (instruction-tuned), tmpfs copy on every worker.
+  model_path: /dev/shm/models/gemma-4-E2B-it
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (see header); the run ends on trainer.total_steps
+  # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
+  # opd_gated_disagree_lookahead_tpu.yaml uses 8).
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/tcod_tasks/train.jsonl  # TPU VM copy (game_file paths remapped)
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        max_env_steps: 30
+        # The trainer scores the turns it samples; the explorer makes no teacher call.
+        defer_teacher: true
+        trainer_teacher_parallel_prompts: 32   # requests in flight per teacher engine
+    default_workflow_type: 'OPD_alfworld_workflow_fullmemory'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_gemma4_e2b_26b_opd_fullmemory_deferred_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:////dev/shm/tcod_buffers/alfworld_gemma4_e2b_26b_opd_fullmemory_deferred_tpu_buffer.db'  # node-local tmpfs: keeps the queue's second copy out of a home directory
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    # engine_num=2, tensor_parallel_size=1 -- matches opd_gated_lookahead.yaml.
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: Gemma 4 26B-A4B (MoE, instruction-tuned); TP4 tested on v4: KV cache 136k tokens at 0.8.
+    - model_path: /dev/shm/models/gemma-4-26B-A4B-it  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (GPU run: 1)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 850  # 250 originally; 350 on 2026-10-30 (exact resume from 250); 850 on 2026-10-30 (exact resume from 350) to match the gated 350-step run's wall-clock (~17 h of steps at ~178 s vs ~72 s here)
+  save_interval: 850  # was 50; from 350 on only the last checkpoint is kept (user); the trainer also saves when it stops on an error
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

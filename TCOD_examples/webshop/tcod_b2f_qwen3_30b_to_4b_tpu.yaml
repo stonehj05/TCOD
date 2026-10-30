@@ -1,0 +1,126 @@
+# TCOD-b2f (Backward-to-Forward temporal curriculum), the repo's original TCOD_examples/webshop/tcod_b2f.yaml
+# on Cloud TPU with OUR student / teacher: plain Qwen3-4B / plain Qwen3-30B-A3B (the original names
+# Qwen2.5-7B-Instruct and a placeholder teacher). The WebShop counterpart of
+# TCOD_examples/scienceworld/tcod_b2f_qwen3_30b_to_4b_tpu.yaml.
+# Workflow: trinity/common/workflows/envs/TCOD/webshop/TCOD_b2f_workflow_tpu.py = TCOD_b2f_webshop_workflow
+# with games on our shared WebShop servers (the same shop as TCOD's: full product set, human goals,
+# `text_rich`). Per training episode the game is advanced along the session's expert actions by
+# k = max(0, len(expert) - 1 - explore_step // checkpoint_steps) actions and the Student plays on from there
+# (to step 15); vanilla OPD on every Student turn. Sessions without expert actions start at the beginning.
+#
+# Expert actions: TCOD's WebShop data has none, so (user, 2026-10-22: "collect teacher experts") they are
+# collected as UOPD's reproduction of TCOD-B2F on WebShop does: one greedy teacher (our Qwen3-30B-A3B)
+# rollout per training session with this workflow's prompts, kept only if it scores 1 and replays
+# (scripts/tpu/eval/collect_webshop_experts.sh -> webshop_data_expert/train.jsonl; the same 4096 sessions).
+#
+# As in the original: algorithm, lr, batch sizes, curriculum (linear, checkpoint_steps 4, total_steps 150),
+# temperatures, 15 env steps, 8 runners per engine, token limits, 150 training steps, dynamic_by_explorer
+# sync. Prompts, parser: TCOD's WebShop utils.py (TCOD's template, the last 2 observation-action pairs in
+# the message, full conversation). The Teacher scores in the explorer (no defer_teacher).
+# Not as in the original: the models; the expert data (above); the TPU backends and engine layout;
+# checkpoint sync instead of NCCL; a checkpoint every 50 steps (original: final only); no in-training eval
+# taskset (evaluated afterwards with scripts/tpu/eval); tensorboard instead of wandb.
+#
+# TPU layout (v4-32): worker 0 = trainer, workers 1-2 = one 30B-A3B teacher each, worker 3 = 4
+# students. Launch: ~/tcod_runs/launch_webshop_tcod_b2f.sh (cluster bring-up, checks, tmpfs links).
+project: "WEBSHOP_TCOD"
+name: "webshop_tcod_b2f_qwen3_30b_to_4b_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: Qwen/Qwen3-4B
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (4 students + 2 x 4 teacher) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only (original: 150); the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data_expert  # TCOD's 4096 sessions + teacher expert actions; on every worker
+      split: train
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 15
+        # Back-to-front curriculum, as in tcod_b2f.yaml
+        total_steps: 150
+        checkpoint_strategy: linear
+        checkpoint_steps: 4
+    default_workflow_type: 'trinity.common.workflows.envs.TCOD.webshop.TCOD_b2f_workflow_tpu.TCOD_b2f_webshop_workflow_tpu'
+  trainer_input:
+    experience_buffer:
+      name: webshop_tcod_b2f_qwen3_30b_to_4b_tpu_buffer
+      storage_type: queue
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_tcod_b2f_qwen3_30b_to_4b_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 4  # TPU: 4 students, one chip each (original: 2 x TP2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-30B-A3B  # TPU: tmpfs copy on each teacher VM (start_cluster.sh)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one whole VM each (original: 1 x TP2)
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.8  # TPU: tested on v4
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 150
+  save_interval: 50  # original: 150 (final only); every 50 here so the run can be evaluated along the way
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

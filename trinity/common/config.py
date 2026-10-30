@@ -126,6 +126,10 @@ class TaskSelectorConfig:
 
     # For shuffle
     seed: int = 42
+    # For shuffle: a new permutation each epoch, as DASH-OPD's ShuffleSelector. False keeps TCOD's,
+    # which seeds the next epoch's order from the index before it is advanced and so repeats the
+    # first epoch's permutation every epoch.
+    reshuffle_each_epoch: bool = False
 
     # Estimator Config
     feature_keys: List[str] = field(default_factory=lambda: [])
@@ -183,6 +187,9 @@ class StorageConfig:
     capacity: int = 10000
     max_read_timeout: float = 1800
     replay_buffer: Optional[ReplayBufferConfig] = field(default_factory=ReplayBufferConfig)
+    # DASH-OPD: shuffle each batch put into the queue (reproducibly, see queue.prepare_experience_batch)
+    shuffle_experiences: bool = False
+    shuffle_seed: int = 42
 
     # used for StorageType.SQL
     max_retry_times: int = 3
@@ -303,6 +310,9 @@ class ExperienceBufferConfig:
     capacity: int = 10000
     max_read_timeout: float = 1800
     replay_buffer: Optional[ReplayBufferConfig] = field(default_factory=ReplayBufferConfig)
+    # DASH-OPD: shuffle each batch put into the queue (reproducibly, see queue.prepare_experience_batch)
+    shuffle_experiences: bool = False
+    shuffle_seed: int = 42
 
     # used for StorageType.SQL
     max_retry_times: int = 3
@@ -337,6 +347,8 @@ class ExperienceBufferConfig:
             capacity=self.capacity,
             max_read_timeout=self.max_read_timeout,
             replay_buffer=self.replay_buffer,
+            shuffle_experiences=self.shuffle_experiences,
+            shuffle_seed=self.shuffle_seed,
             max_retry_times=self.max_retry_times,
             max_retry_interval=self.max_retry_interval,
             split=self.split,
@@ -524,6 +536,10 @@ class InferenceModelConfig:
     min_response_tokens: Optional[int] = None
     # if not set, use `model.enable_prompt_truncation`
     enable_prompt_truncation: Optional[bool] = None
+    # True (DASH-OPD's behavior): an over-long prompt keeps its last max_prompt_tokens tokens and the
+    # model still generates from it (truncate_status "prompt_truncated", response kept for training).
+    # False (TCOD's): the prompt is cut and a fake one-token response with an empty action mask is returned.
+    prompt_truncation_keep_recent: bool = False
     # If not set, use `model.repetition_penalty`
     repetition_penalty: Optional[float] = None
     # used for testing very long response generation, do not set it unless you know what you are doing

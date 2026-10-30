@@ -1,6 +1,8 @@
 """Ray Queue storage"""
 
 import asyncio
+import hashlib
+import random
 import time
 from abc import ABC, abstractmethod
 from collections import deque
@@ -23,6 +25,38 @@ def is_database_url(path: str) -> bool:
 
 def is_json_file(path: str) -> bool:
     return path.endswith(".json") or path.endswith(".jsonl")
+
+
+# Ported from DASH-OPD (trinity/buffer/storage/queue.py), unchanged.
+def prepare_experience_batch(exp_list: List, shuffle: bool, seed: int) -> List:
+    """Copy a batch and optionally shuffle it reproducibly.
+
+    The Explorer batch id and model version make the permutation vary between
+    rollout batches without depending on asynchronous arrival order.
+    """
+
+    prepared = list(exp_list)
+    if not shuffle or len(prepared) < 2:
+        return prepared
+
+    prepared.sort(
+        key=lambda exp: (
+            str(getattr(getattr(exp, "eid", None), "batch", "")),
+            str(getattr(getattr(exp, "eid", None), "task", "")),
+            str(getattr(getattr(exp, "eid", None), "run", "")),
+            str(getattr(getattr(exp, "eid", None), "step", "")),
+        )
+    )
+    batch_ids = sorted({str(getattr(getattr(exp, "eid", None), "batch", "")) for exp in prepared})
+    model_versions = sorted(
+        {str(getattr(exp, "info", {}).get("model_version", "")) for exp in prepared}
+    )
+    seed_material = "|".join((str(seed), ",".join(batch_ids), ",".join(model_versions))).encode(
+        "utf-8"
+    )
+    batch_seed = int.from_bytes(hashlib.sha256(seed_material).digest()[:8], "big")
+    random.Random(batch_seed).shuffle(prepared)
+    return prepared
 
 
 class PriorityFunction(ABC):
@@ -370,6 +404,11 @@ class QueueStorage:
 
     async def put_batch(self, exp_list: List) -> None:
         """Put batch of experience."""
+        exp_list = prepare_experience_batch(
+            exp_list,
+            shuffle=self.config.shuffle_experiences,
+            seed=self.config.shuffle_seed,
+        )
         await self.queue.put(exp_list)
         if self.writer is not None:
             self.writer.write(exp_list)
