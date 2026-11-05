@@ -153,9 +153,14 @@ def _worker(
             game_file = task["game_file"]
             env = None
             try:
-                # uopd: UOPD's game setup (AlfredInfos, `won` reported), as in its workflows
-                env = (run_episode_full_memory.uopd_utils()._create_alfworld_env(game_file)
-                       if template == "uopd" else _create_alfworld_env(game_file))
+                # uopd: UOPD's game setup (AlfredInfos, `won` reported), as in its workflows;
+                # dash: DASH-OPD's (no AlfredExpert wrapper), as in its workflows
+                if template == "uopd":
+                    env = run_episode_full_memory.uopd_utils()._create_alfworld_env(game_file)
+                elif template == "dash":
+                    env = run_episode_full_memory.dash_utils()._create_alfworld_env(game_file)
+                else:
+                    env = _create_alfworld_env(game_file)
                 observation, info = env.reset()
                 task_description = _extract_task(observation)
 

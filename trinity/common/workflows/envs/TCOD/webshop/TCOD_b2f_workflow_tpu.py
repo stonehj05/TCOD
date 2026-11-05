@@ -15,6 +15,7 @@ from typing import List, Optional
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import Task, Workflow
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored
 from trinity.common.workflows.envs.TCOD.webshop.utils import (
     HISTORY_LENGTH,
     WEBSHOP_TEMPLATE,
@@ -289,7 +290,7 @@ class TCOD_b2f_webshop_workflow_tpu(Workflow):
                 f"tokens={len(response.tokens)}, prompt_length={response.prompt_length}"
             )
 
-            response.teacher_logprobs = teacher_resp_logprobs
+            response.teacher_logprobs = fill_unscored(teacher_resp_logprobs, student_resp_logprobs)  # TPU: NaN = unscored
 
             if response.metrics is None:
                 response.metrics = {}
@@ -415,7 +416,7 @@ class TCOD_b2f_webshop_workflow_tpu(Workflow):
                 f"tokens={len(response.tokens)}, prompt_length={response.prompt_length}"
             )
 
-            response.teacher_logprobs = teacher_resp_logprobs
+            response.teacher_logprobs = fill_unscored(teacher_resp_logprobs, student_resp_logprobs)  # TPU: NaN = unscored
 
             if response.metrics is None:
                 response.metrics = {}

@@ -276,6 +276,8 @@ class WorkflowRunner:
             st = time.time()
             model_version = await self.model_wrapper.model_version_async
             self.runner_state["model_version"] = model_version
+            if model_version is not None:  # DASH-OPD's teacher-start schedule reads it
+                task.rollout_model_version = int(model_version)
             exps, metrics = await self._run_task(task, repeat_times, run_id_base)
             assert exps is not None and len(exps) > 0, "An empty experience is generated"
             # set eid for each experience

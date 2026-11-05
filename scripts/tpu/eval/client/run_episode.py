@@ -41,7 +41,72 @@ from alfworld_agent_utils import (
 # lines and parse_action from its utils.py; one user message per turn holding the last HISTORY_LENGTH (2) steps,
 # as the release (no full conversation, whatever --full-memory says); the no-history template on the first turn
 # only; success = the game's `won` flag (the game is created with UOPD's _create_alfworld_env, see 12_evaluate_checkpoint.py).
-TEMPLATES = ("paper", "release_think", "tcod_train", "uopd")
+# "dash": DASH-OPD's own eval rollout (github.com/Lucian1115/DASH-OPD, its TCOD_alfworld_eval_workflow with the
+# settings of configurations/alfworld/dash_opd_bench.yaml): build_alfworld_prompt, parse_action, _format_history and
+# format_observation from its utils.py (trinity/common/workflows/envs/DASH/alfworld/utils.py, copied unchanged);
+# full chat history; history_length 2; the no-history template for the first 3 turns; success = the episode ends.
+TEMPLATES = ("paper", "release_think", "tcod_train", "uopd", "dash")
+DASH_HISTORY_LENGTH, DASH_INITIAL_NO_HISTORY_TURNS = 2, 3  # dash_opd_bench.yaml
+
+
+def dash_utils():
+    import importlib.util
+    import os
+
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "../../../../trinity/common/workflows/envs/DASH/alfworld/utils.py",
+    )
+    spec = importlib.util.spec_from_file_location("dash_alfworld_utils", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run_episode_dash(env, model_client, task_description, observation, info, max_steps):
+    """DASH-OPD's TCODAlfworldEvalWorkflow._run_episode loop, student only."""
+    d = dash_utils()
+    history: List[str] = []
+    memory: List[Dict[str, str]] = []
+    step_log: List[Dict] = []
+    actions: List[str] = []
+    done, final_reward, rounds = False, 0.0, max_steps
+    for step in range(max_steps):
+        formatted_observation = d.format_observation(observation)
+        admissible_commands = info.get("admissible_commands", [])
+        if admissible_commands and isinstance(admissible_commands[0], list):
+            admissible_commands = admissible_commands[0]
+        formatted_actions = "\n ".join(f"'{a}'" for a in admissible_commands if a != "help")
+        user_content = d.build_alfworld_prompt(
+            task_description=task_description,
+            step_count=step,
+            history=history,
+            history_length=DASH_HISTORY_LENGTH,
+            initial_no_history_turns=DASH_INITIAL_NO_HISTORY_TURNS,
+            current_observation=formatted_observation,
+            admissible_actions=formatted_actions,
+            use_initial_no_history_template=True,  # retain_full_chat_history: true
+        )
+        memory = memory + [{"role": "user", "content": user_content}]
+        response_text, raw = model_client.chat(memory, available_actions={"commands": admissible_commands})
+        response_text = response_text or ""
+        memory.append({"role": "assistant", "content": response_text})
+        finish_reason = None
+        if raw and raw.get("choices"):
+            finish_reason = raw["choices"][0].get("finish_reason")
+        action = d.parse_action(response_text)
+        history.append(d._format_history(formatted_observation, step + 1, action, think=None))
+        actions.append(action)
+        observation, reward, done, info = env.step(action)
+        step_log.append({"step": step, "prompt": user_content, "response": response_text,
+                         "finish_reason": finish_reason, "parsed_action": action,
+                         "action_admissible": action in admissible_commands,
+                         "reward": reward, "done": done})
+        if done:
+            rounds, final_reward = step + 1, 1.0
+            break
+    return {"actions": actions, "env_rounds": rounds, "final_reward": final_reward, "done": done,
+            "step_log": step_log, "final_observation": observation, "final_info": info}
 
 
 def uopd_utils():
@@ -132,6 +197,8 @@ def run_episode(
 ) -> Dict:
     if template == "uopd":
         return _run_episode_uopd(env, model_client, task_description, observation, info, max_steps)
+    if template == "dash":
+        return _run_episode_dash(env, model_client, task_description, observation, info, max_steps)
     if template == "release_think":
         release = _release_utils()
         template_no_his, template_his = release.ALFWORLD_TEMPLATE_NO_HIS, release.ALFWORLD_TEMPLATE

@@ -31,6 +31,7 @@ from typing import List, Optional, Tuple
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import Task
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored  # TPU: NaN = unscored
 from trinity.common.workflows.envs.TCOD.webshop.ftb_release_b2f_workflow import (  # TPU port: the release's copy
     TCOD_b2f_webshop_workflow,
 )
@@ -217,7 +218,7 @@ class LegacyLiveTeacherB2FWebShopWorkflow(TCOD_b2f_webshop_workflow):
         for i, response in enumerate(turn_responses):
             tl_full = await self.teacher_model.logprobs_async(tokens=response.tokens.tolist(), temperature=self.temperature)
             rs = response.prompt_length - 1
-            teacher_lp = tl_full[rs:]; student_lp = response.logprobs
+            student_lp = response.logprobs; teacher_lp = fill_unscored(tl_full[rs:], student_lp)  # TPU: NaN = unscored
             response.teacher_logprobs = teacher_lp
             response.reward = float(self._final_reward)
             response.eid.run = getattr(self, "run_id_base", 0)
@@ -500,8 +501,8 @@ class _FutureBridgeWebShopBase(TCOD_b2f_webshop_workflow):
                 temperature=self.temperature,
             )
             rs = response.prompt_length - 1
-            teacher_lp = teacher_lp_full[rs:]
             student_lp = response.logprobs
+            teacher_lp = fill_unscored(teacher_lp_full[rs:], student_lp)  # TPU: NaN = unscored
 
             assert len(teacher_lp) == len(student_lp), (
                 f"Length mismatch: teacher={len(teacher_lp)}, student={len(student_lp)}"
@@ -643,6 +644,9 @@ class _FutureBridgeWebShopBase(TCOD_b2f_webshop_workflow):
 
         student_lp = student_lp_full[rs:]
         teacher_lp = teacher_lp_full[rs:]
+        if len(student_lp) == len(teacher_lp):  # TPU: NaN = unscored
+            student_lp = fill_unscored(student_lp, teacher_lp)
+            teacher_lp = fill_unscored(teacher_lp, student_lp)
 
         if len(student_lp) != len(teacher_lp) or len(student_lp) == 0:
             return []

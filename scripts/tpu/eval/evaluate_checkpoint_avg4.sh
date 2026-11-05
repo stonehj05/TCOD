@@ -39,11 +39,14 @@ md() { curl -sf -m 5 -H Metadata-Flavor:Google "http://metadata.google.internal/
 if [ -n "${WORKER_IPS:-}" ]; then read -r -a IPS <<< "$WORKER_IPS"
 else mapfile -t IPS < <(md attributes/worker-network-endpoints | tr ',' '\n' | awk -F: 'NF>=3 {print $3}'); fi
 [ "${#IPS[@]}" -gt 0 ] || IPS=(localhost)
+# Worker w runs its jobs here if its address is this VM's (any position in the list), else over ssh: with
+# WORKER_IPS the jobs can go to other workers only (e.g. one 2-host pair, started from worker 0).
+is_local() { [ "${IPS[$1]}" = localhost ] || hostname -I | tr ' ' '\n' | grep -qx "${IPS[$1]}"; }
 
 # One slot per chip: "worker_index chip_index". Also ship the eval client to the other workers.
 SLOTS=()
 for w in "${!IPS[@]}"; do
-    if [ "$w" = 0 ]; then n=$(ls /dev/accel* 2>/dev/null | wc -l)
+    if is_local "$w"; then n=$(ls /dev/accel* 2>/dev/null | wc -l)
     else
         rsync -a -e "$SSH" "$HERE/" "${IPS[$w]}:$HERE/" || exit 1
         [ "$PROBE_DIR" = "$HERE/client" ] || rsync -a -e "$SSH" --exclude data/ "$PROBE_DIR/" "${IPS[$w]}:$PROBE_DIR/" || exit 1
@@ -66,7 +69,7 @@ for rep in $(seq 1 "$N_REPS"); do
             read -r w chip <<< "${SLOTS[$(( job % C ))]}"
             out="$OUT_DIR/eval_${LABEL}.rep${rep}.${split}.part${part}"
             cmd="EVAL_TEMPLATE='${EVAL_TEMPLATE:-}' EVAL_MAX_TOKENS='${EVAL_MAX_TOKENS:-}' EVAL_MAX_ENV_STEPS='${EVAL_MAX_ENV_STEPS:-}' PROBE_DIR='$PROBE_DIR' TASK_DIR='$TASK_DIR' VENV='$VENV' bash '$HERE/run_eval_job.sh' '$MODEL_PATH' '$LABEL' $chip $rep $split $start $end '$out'"
-            if [ "$w" = 0 ]; then bash -c "$cmd" > "$out.log" 2>&1 &
+            if is_local "$w"; then bash -c "$cmd" > "$out.log" 2>&1 &
             else $SSH "${IPS[$w]}" "$cmd" > "$out.log" 2>&1 & fi
             echo "job $job: worker $w chip $chip rep$rep $split [$start,$end)"
             job=$(( job + 1 ))

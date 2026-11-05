@@ -8,6 +8,7 @@ from typing import List, Optional
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import Task, Workflow
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored  # TPU: NaN = unscored
 from trinity.common.workflows.envs.TCOD.webshop.ftb_release_utils import (  # TPU port: the release's utils
     HISTORY_LENGTH,
     WEBSHOP_TEMPLATE,
@@ -245,8 +246,8 @@ class TCOD_b2f_webshop_workflow(Workflow):
             )
 
             resp_start = response.prompt_length - 1
-            teacher_resp_logprobs = teacher_logprobs[resp_start:]
             student_resp_logprobs = response.logprobs
+            teacher_resp_logprobs = fill_unscored(teacher_logprobs[resp_start:], student_resp_logprobs)  # TPU: NaN = unscored
 
             assert len(teacher_resp_logprobs) == len(student_resp_logprobs), (
                 f"Length mismatch: teacher_logprobs={len(teacher_resp_logprobs)}, "
@@ -371,8 +372,8 @@ class TCOD_b2f_webshop_workflow(Workflow):
             )
 
             resp_start = response.prompt_length - 1
-            teacher_resp_logprobs = teacher_logprobs[resp_start:]
             student_resp_logprobs = response.logprobs
+            teacher_resp_logprobs = fill_unscored(teacher_logprobs[resp_start:], student_resp_logprobs)  # TPU: NaN = unscored
 
             assert len(teacher_resp_logprobs) == len(student_resp_logprobs), (
                 f"Length mismatch: teacher_logprobs={len(teacher_resp_logprobs)}, "

@@ -40,6 +40,7 @@ from typing import List, Optional, Tuple
 
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import Task
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored
 from trinity.common.workflows.envs.TCOD.alfworld.Bridge_TCOD_kl_workflow import (
     Bridge_TCOD_kl_alfworld_workflow,
 )
@@ -1190,8 +1191,8 @@ class FutureBridgeAlfworldWorkflow(_FutureBridgeB2FAlfworldBase):
                 tl_full = await self.teacher_model.logprobs_async(
                     tokens=full_tokens, temperature=self.temperature
                 )
-                sl = sl_full[resp_start:]
-                tl = tl_full[resp_start:]
+                sl = fill_unscored(sl_full[resp_start:], tl_full[resp_start:])  # TPU: NaN = unscored
+                tl = fill_unscored(tl_full[resp_start:], sl)
 
                 adv = tl.float() - sl.float()
                 pos_count += (adv > 0).sum().item()

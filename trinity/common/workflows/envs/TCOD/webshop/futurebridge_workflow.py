@@ -43,6 +43,7 @@ import torch
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import Task
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored  # TPU: NaN = unscored
 from trinity.common.workflows.envs.TCOD.webshop.ftb_release_base import (  # TPU port: the release's futurebridge_base.py
     _FutureBridgeWebShopBase,
     BRIDGE_STEP_OFFSET,
@@ -384,8 +385,8 @@ class FutureBridgeNoFutureValidationWebShopWorkflow(FutureBridgeWebShopWorkflow)
                 tl_full = await self.teacher_model.logprobs_async(
                     tokens=full_tokens, temperature=self.temperature
                 )
-                sl = sl_full[rs:]
-                tl = tl_full[rs:]
+                sl = fill_unscored(sl_full[rs:], tl_full[rs:])  # TPU: NaN = unscored
+                tl = fill_unscored(tl_full[rs:], sl)
                 adv = tl.float() - sl.float()
                 pos_count += int((adv > 0).sum())
                 total_count += len(adv)

@@ -85,6 +85,14 @@ WORKFLOWS: Registry = Registry(
         "UOPD_OPD_webshop_workflow": "trinity.common.workflows.envs.UOPD.webshop.OPD_workflow.OnPolicyDistillVerlAgentWebshopWorkflow",
         # DASH-OPD (github.com/Lucian1115/DASH-OPD) ScienceWorld vanilla OPD, copied unchanged
         "DASH_repo_OPD_scienceworld_workflow": "trinity.common.workflows.envs.DASH.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",
+        # DASH-OPD's own method on ScienceWorld (its base: DASH_repo_OPD_scienceworld_workflow above)
+        "DASH_OPD_scienceworld_workflow": "trinity.common.workflows.envs.DASH.scienceworld.dash_opd_workflow.DASHOPDScienceworldWorkflow",
+        # DASH-OPD's own method on ALFWorld (its base OPD workflow renamed: TCOD registers OPD_alfworld_workflow)
+        "DASH_OPD_alfworld_workflow": "trinity.common.workflows.envs.DASH.alfworld.dash_opd_workflow.DASHOPDAlfworldWorkflow",
+        "DASH_repo_OPD_alfworld_workflow": "trinity.common.workflows.envs.DASH.alfworld.OPD_workflow.OnPolicyDistillVerlAgentAlfworldWorkflow",
+        # DASH-OPD's own method on WebShop, on our shared WebShop servers (base renamed: TCOD registers OPD_webshop_workflow)
+        "DASH_OPD_webshop_workflow": "trinity.common.workflows.envs.DASH.webshop.dash_opd_workflow.DASHOPDWebshopWorkflow",
+        "DASH_repo_OPD_webshop_workflow": "trinity.common.workflows.envs.DASH.webshop.OPD_workflow.OnPolicyDistillVerlAgentWebshopWorkflow",
         "TCOD_b2f_alfworld_workflow": "trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow.TCOD_b2f_alfworld_workflow",
         "OPD_scienceworld_workflow": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow.OnPolicyDistillVerlAgentScienceworldWorkflow",
         "OPD_scienceworld_workflow_dashtpl": "trinity.common.workflows.envs.TCOD.scienceworld.OPD_workflow_dashtpl.OnPolicyDistillScienceworldWorkflowDashTpl",

@@ -1,0 +1,132 @@
+# UOPD on ALFWorld with the Qwen3-1.7B student / Qwen3-8B teacher, on HALF of the v4-32 (8 chips) (user, 2026-11-02:
+# "staying faithful to their original implementation"). Everything as in uopd_qwen3_30b_to_4b_tpu.yaml (the release
+# github.com/onepounchman/UOPD commit 61f90c5, configs/alfworld/3b/uopd.yaml, ported to TPU; see its header for what
+# differs from the release, incl. 30 game steps instead of 50), except the models and the engine layout.
+# Evaluate with its own rollout: EVAL_TEMPLATE=uopd EVAL_MAX_TOKENS=512.
+# TPU layout (one 2-host Ray cluster of its own, scripts/tpu/start_cluster_pair.sh): one worker = trainer (4 chips),
+# the other = 2 students + 2 teachers (Qwen3-8B, one chip each), as the 1.7B/8B OPD runs. Launcher with checks,
+# checkpoint links and eval: ~/tcod_runs/launch_alfworld_baseline_qwen3_1.7b_8b_pair.sh <method> <pair>   (on worker 0)
+project: "ALFWORLD_TCOD"
+name: "alfworld_uopd_qwen3_8b_to_1.7b_8chip_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so a pre-created run dir (tmpfs links for the checkpoints) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+    lr_warmup_steps_ratio: 0.0
+  policy_loss_fn: uopd
+  policy_loss_fn_args:
+    loss_agg_mode: token-mean
+    sft_coef: 1.0
+    sft_mode: plain
+
+model:
+  model_path: /dev/shm/models/Qwen3-1.7B  # TPU: tmpfs copy on both hosts
+  max_prompt_tokens: 2048  # as in the release (one message per turn)
+  max_response_tokens: 512
+
+cluster:
+  node_num: 2      # TPU: 2 VMs x 4 chips; trainer = 8 - (2 students + 2 teachers) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 600  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/uopd_tasks/alfworld/train.jsonl  # release manifest, game_file paths on this VM
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        logprobs: 0
+      workflow_args:  # the release's, verbatim except max_env_steps
+        max_env_steps: 30  # as our other runs (release: 50)
+        detect_uq: confidence
+        detect_uq_seed: 0
+        tau: 1.28
+        detect_temperature: 1.0
+        trigger_cap: null
+        sft_warmup_steps: 0
+        cold_start_takeover: false
+        tau_mode: quantile
+        rate_schedule: linear
+        r_start: 0.3
+        r_end: 0.05
+        r_decay_steps: 120
+        window_size: 1000
+        window_n_min: 300
+        teacher_sched: pipeline
+        teacher_takeover: true
+        temperature: 1.0
+      task_selector:
+        selector_type: random
+        seed: 42
+    default_workflow_type: 'UOPD_alfworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_uopd_qwen3_8b_to_1.7b_8chip_tpu_buffer
+      storage_type: queue
+      # Absolute path on node-local tmpfs (the dir must exist on every worker); see ftb_qwen3_30b_to_4b_tpu.yaml.
+      path: 'sqlite:////dev/shm/tcod_buffers/alfworld_uopd_qwen3_8b_to_1.7b_8chip_tpu_buffer.db'
+
+explorer:
+  runner_per_model: 8  # as in the release
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 2  # TPU: 2 students, one chip each (release: 2 x tensor_parallel 2 GPUs)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher: scores every Student turn and writes the response on intervention turns.
+    - model_path: /dev/shm/models/Qwen3-8B  # TPU: tmpfs copy on the inference host
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: 2 teachers, one chip each (release: 1 x tensor_parallel 2 GPUs)
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.75  # as in opd_qwen3_1.7b_8b_fullmemory_8chip_tpu.yaml (room for the scoring program)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384  # as in the release; single-message prompts stay under ~1k tokens (max 978 over 40 games)
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+  eval_on_startup: false
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 500  # user, 2026-11-03: "let's schedule 500 steps first" (release: 250)
+  save_interval: 100  # TPU: disk on worker 0; release: 250
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

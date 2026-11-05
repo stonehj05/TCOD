@@ -19,6 +19,8 @@ ADVANTAGE_FN: Registry = Registry(
         "rec": "trinity.algorithm.advantage_fn.rec_advantage.RECGroupedAdvantage",
         "on_policy_distill": "trinity.algorithm.advantage_fn.on_policy_distill_advantage.OnPolicyDistillAdvantage",
         "multi_turn_opd": "trinity.algorithm.advantage_fn.on_policy_distill_advantage.MultiTurnOpdAdvantage",
+        # DASH-OPD (github.com/Lucian1115/DASH-OPD), copied unchanged
+        "guided_opd": "trinity.algorithm.advantage_fn.guided_opd_advantage.GuidedOPDAdvantage",
         "jsd": "trinity.algorithm.advantage_fn.jsd_advantage.JSDAdvantage",
         "sdpo": "trinity.algorithm.advantage_fn.sdpo_advantage.SDPOAdvantage",
     },

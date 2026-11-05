@@ -21,6 +21,8 @@ POLICY_LOSS_FN: Registry = Registry(
         "importance_sampling": "trinity.algorithm.policy_loss_fn.importance_sampling_policy_loss.ImportanceSamplingLossFn",
         "sdpo": "trinity.algorithm.policy_loss_fn.sdpo_policy_loss.SDPOPolicyLossFn",
         "uopd": "trinity.algorithm.policy_loss_fn.uopd_policy_loss.UOPDPolicyLossFn",
+        # DASH-OPD (github.com/Lucian1115/DASH-OPD), copied unchanged; tunix: trainer/tunix/logps.py guided_opd_loss
+        "guided_opd": "trinity.algorithm.policy_loss_fn.guided_opd_policy_loss.GuidedOPDPolicyLossFn",
     },
 )
 

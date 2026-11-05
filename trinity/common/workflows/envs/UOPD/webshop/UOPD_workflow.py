@@ -16,6 +16,8 @@ import torch
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import WORKFLOWS, Task
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored  # TPU, see _score_turn
+from trinity.common.workflows.envs.DASH.segment_kl import get_segment_tokenizer
 from trinity.common.workflows.envs.UOPD.delta_window import (
     get_delta_window,
     intervention_rate,
@@ -31,6 +33,7 @@ from trinity.common.workflows.envs.UOPD.uopd_common import (
     in_cold_start,
     rate_tracking_error,
     should_trigger,
+    strip_teacher_think_close,
     trigger_turn_metrics,
 )
 from trinity.common.workflows.envs.UOPD.webshop.OPD_workflow import (
@@ -198,7 +201,8 @@ class UOPDWebshopWorkflow(OnPolicyDistillVerlAgentWebshopWorkflow):
             f"Length mismatch: teacher={len(teacher_resp_lp)}, student={len(response.logprobs)}, "
             f"tokens={len(response.tokens)}, prompt_length={response.prompt_length}"
         )
-        return teacher_resp_lp
+        # TPU (not in the release): NaN = token vLLM-TPU could not score; use the student's logprob there
+        return fill_unscored(teacher_resp_lp, response.logprobs)
 
     async def run_async(self) -> List[Experience]:
         # A reset can replace the task without reconstructing this workflow.
@@ -297,10 +301,14 @@ class UOPDWebshopWorkflow(OnPolicyDistillVerlAgentWebshopWorkflow):
     async def _get_teacher_turn(self, turn_index: int, memory) -> Experience:
         fut = self._decode_futures.get(turn_index)
         if fut is not None:
-            return (await fut)[0]
-        return (
-            await self.teacher_model.chat_async(memory, **self._teacher_decode_kwargs())
-        )[0]
+            turn = (await fut)[0]
+        else:
+            turn = (
+                await self.teacher_model.chat_async(memory, **self._teacher_decode_kwargs())
+            )[0]
+        # TPU (not in the release): see strip_teacher_think_close. Student tokenizer: same Qwen3 vocab.
+        strip_teacher_think_close(turn, get_segment_tokenizer(await self.model.model_path_async))
+        return turn
 
     async def _score_and_finalize(
         self,

@@ -1,0 +1,175 @@
+# DASH-OPD on ScienceWorld as its release runs it: github.com/Lucian1115/DASH-OPD (commit dc0aa86),
+# configurations/scienceworld/dash_opd.yaml, with the Qwen3-1.7B student (as the release's file) and the Qwen3-8B
+# teacher, on the WHOLE v4-32 (16 chips) (user, 2026-11-05: "after the gated eval, also build a DASH-OPD run for
+# science world and run it"). Changes are only those the TPU / this machine / the teacher need; everything else is the
+# release's file as is. Same TPU adaptations as TCOD_examples/alfworld/dash_opd_qwen3_8b_to_1.7b_8chip_tpu.yaml.
+#
+# Workflow: DASH_OPD_scienceworld_workflow = the release's scienceworld/dash_opd_workflow.py
+# (trinity/common/workflows/envs/DASH/scienceworld/), copied unchanged apart from import paths; its OPD base, utils
+# and controller are the ported DASH/scienceworld/OPD_workflow.py, utils.py, DASH/alfworld/dash_opd_workflow.py and
+# DASH/dash_opd_controller.py. Per episode the turn generator switches between Student and Teacher (teacher-start
+# probability decaying 1 -> 0 over 250 steps, support-debt takeover / return thresholds, stagnation takeover); both
+# models score every turn. Loss: guided_opd advantage + policy loss (tunix: logps.guided_opd_loss).
+# DASH-OPD framework behaviour this relies on, ported (opt-in switches, off by default):
+#   rollout_model / teacher prompt_truncation_keep_recent  over-long prompts keep their last 10240 tokens
+#   task_selector.reshuffle_each_epoch                       DASH-OPD's ShuffleSelector
+#   experience_buffer.shuffle_experiences                    each rollout batch shuffled (seed 42)
+#   task.rollout_model_version                               the policy version a task is rolled out with
+#
+# Not as in DASH-OPD:
+#   - teacher Qwen3-8B (release: Qwen3-30B-A3B); paths: tmpfs copies of plain Qwen3-1.7B / Qwen3-8B
+#   - TPU backends (vllm_tpu, tunix trainer), engine layout (worker 0 trainer; 6 students + 6 teachers x TP1 on
+#     workers 1-3; release: 2 x TP2, 1 x TP2), sync by checkpoint instead of NCCL; verl-only trainer keys
+#     (use_dynamic_bsz, max_token_len_per_gpu, ulysses) dropped; teacher gpu_memory_utilization 0.75
+#   - TPU: NaN logprobs from vLLM-TPU are replaced by the other model's in _score_turn and in the trainer
+#   - checkpoint every 50 steps (release: 250, final only) so the last three can be evaluated
+#   - no in-training eval (release: enable_training_eval false); its eval taskset, post-training benchmark
+#     (lifecycle) and launcher-only keys (ablation_study, enable_name_conflict_check, eval_interval,
+#     eval_step_offset, eval_on_startup, training_rollout_sample_interval) dropped; evaluated afterwards with
+#     scripts/tpu/eval (DASH-OPD's prompts)
+#   - rollout_args min_p: 0.0 dropped (= disabled, vLLM's default; our config has no such key)
+#   - task file: TCOD's get_sciworld_data.py split (identical to the release's script) on every worker; buffer on
+#     tmpfs; project SCIENCEWORLD_TCOD (release: SCIENCEWORLD); tensorboard instead of wandb
+#   - buffer.total_steps 3000: explorer upper bound only, the run ends on trainer.total_steps 250 (as our other runs)
+# Launcher: ~/tcod_runs/launch_sciworld_dash_opd_qwen3_1.7b_8b_16chip.sh
+project: "SCIENCEWORLD_TCOD"
+name: "scienceworld_dash_opd_qwen3_8b_to_1.7b_16chip_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for the checkpoints) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: guided_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  policy_loss_fn: guided_opd
+  policy_loss_fn_args:
+    clip_range: 0.2
+    clip_ratio_c: 3.0
+    loss_agg_mode: token-mean
+    enable_sequence_masking: false
+    delta_sequence_masking: 0.1
+    fallback_to_policy_gradient: false
+    kl_coef: 1.0
+  loss_agg_mode: "token-mean"
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: /dev/shm/models/Qwen3-1.7B  # TPU: tmpfs copy on every worker
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 4      # TPU: 4 VMs x 4 chips; trainer = 16 - (6 students + 6 teachers) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: sciworld
+      storage_type: file
+      path: /home/haojun_shi/sci-data/tcod_tasks/train.jsonl  # TCOD's get_sciworld_data.py split (2294 games); on every worker
+      split: train
+      task_selector:
+        selector_type: shuffle
+        seed: 42
+        reshuffle_each_epoch: true  # DASH-OPD's ShuffleSelector
+      format:
+        prompt_key: 'task_desc'
+      rollout_args:
+        temperature: 1.0
+        max_tokens: 512
+        top_p: 1.0
+        top_k: -1
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 30
+        history_length: 2
+        initial_no_history_turns: 3
+        include_think_in_history: false
+        retain_full_chat_history: true
+        total_steps: 250
+        # DASH-only controller settings.
+        teacher_start_schedule_enabled: true
+        teacher_takeover_enabled: true
+        student_return_enabled: true
+        action_only_role_switching: true
+        exact_mean_variance: true
+        ema_decay: 0.9
+        ema_variance_floor: 1e-6
+        z_clip: 10.0
+        evidence_decay: 1.0
+        student_drift_slack: 0.0
+        teacher_recovery_slack: 0.0
+        takeover_threshold: 3.0
+        return_threshold: 1.0
+        min_teacher_span: 2
+        teacher_budget_ratio: 1.0
+        stagnation_takeover_enabled: true
+        stagnation_repeat_turns: 3
+    default_workflow_type: 'DASH_OPD_scienceworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: scienceworld_dash_opd_qwen3_8b_to_1.7b_16chip_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/scienceworld_dash_opd_qwen3_8b_to_1.7b_16chip_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  runner_per_model: 8
+  max_timeout: 900
+  max_retry_times: 0
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 6  # TPU: 6 students, one chip each (release: 2 x TP2)
+    tensor_parallel_size: 1
+    prompt_truncation_keep_recent: true  # DASH-OPD's prompt truncation
+    enable_prefix_caching: true
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-8B  # TPU: tmpfs copy on workers 1-3 (release: Qwen3-30B-A3B)
+      engine_type: vllm_tpu
+      engine_num: 6  # TPU: 6 teachers, one chip each (release: 1 x TP2)
+      tensor_parallel_size: 1
+      prompt_truncation_keep_recent: true  # DASH-OPD's prompt truncation (the teacher also generates turns)
+      gpu_memory_utilization: 0.75  # TPU: as the 1.7B/8B ALFWorld / WebShop DASH runs (room for the scoring program)
+      enable_prefix_caching: true
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 10752
+      max_prompt_tokens: 10240
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250
+  save_interval: 50  # release: 250 (final only)
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

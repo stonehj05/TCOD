@@ -23,8 +23,11 @@ from trinity.common.workflows.envs.UOPD.delta_window import (
     get_delta_window,
     intervention_rate,
 )
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored  # TPU, see _score_turn
+from trinity.common.workflows.envs.DASH.segment_kl import get_segment_tokenizer
 from trinity.common.workflows.envs.UOPD.uopd_common import (
     build_trigger_experience,
+    strip_teacher_think_close,
     DETECT_UQ_NEEDS_ENTROPY,
     DETECT_UQ_UNINFORMATIVE,
     cached_detect_uq,
@@ -199,7 +202,8 @@ class UOPDAlfworldWorkflow(OnPolicyDistillVerlAgentAlfworldWorkflow):
             f"Length mismatch: teacher={len(teacher_resp_lp)}, student={len(response.logprobs)}, "
             f"tokens={len(response.tokens)}, prompt_length={response.prompt_length}"
         )
-        return teacher_resp_lp
+        # TPU (not in the release): NaN = token vLLM-TPU could not score; use the student's logprob there
+        return fill_unscored(teacher_resp_lp, response.logprobs)
 
     async def run_async(self) -> List[Experience]:
         # Reset per-episode scheduling state (the instance is reused across tasks).
@@ -283,10 +287,14 @@ class UOPDAlfworldWorkflow(OnPolicyDistillVerlAgentAlfworldWorkflow):
     async def _get_teacher_turn(self, turn_index: int, memory) -> Experience:
         fut = self._decode_futures.get(turn_index)
         if fut is not None:
-            return (await fut)[0]
-        return (
-            await self.teacher_model.chat_async(memory, **self._teacher_decode_kwargs())
-        )[0]
+            turn = (await fut)[0]
+        else:
+            turn = (
+                await self.teacher_model.chat_async(memory, **self._teacher_decode_kwargs())
+            )[0]
+        # TPU (not in the release): see strip_teacher_think_close. Student tokenizer: same Qwen3 vocab.
+        strip_teacher_think_close(turn, get_segment_tokenizer(await self.model.model_path_async))
+        return turn
 
     # -------------------------------------------------------------- finalize
     async def _score_and_finalize(

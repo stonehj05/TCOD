@@ -23,7 +23,7 @@ import optax
 from flax import nnx, struct
 
 from trinity.trainer.tunix import hf_io
-from trinity.trainer.tunix.logps import completion_logps, opd_loss, uopd_loss
+from trinity.trainer.tunix.logps import completion_logps, guided_opd_loss, opd_loss, uopd_loss
 
 
 @struct.dataclass
@@ -86,6 +86,10 @@ class TunixActorWorker:
             loss_impl = uopd_loss
             loss_kwargs = dict(pad_id=self.pad_id, eos_id=self.eos_id, temperature=cfg["temperature"],
                                sft_coef=cfg["sft_coef"], loss_agg_mode=cfg["loss_agg_mode"])
+        elif cfg.get("policy_loss", "ppo") == "guided_opd":
+            # DASH-OPD's GuidedOPDPolicyLossFn: PPO on student turns, kl_coef * NLL on teacher turns
+            loss_impl = guided_opd_loss
+            loss_kwargs = dict(loss_kwargs, kl_coef=cfg["guided_kl_coef"])
         else:
             loss_impl = opd_loss
 
@@ -172,7 +176,15 @@ class TunixActorWorker:
         # MultiTurnOpdAdvantage: detached per-token advantages, masked.
         row_kl = [0.0] * len(rows)  # per-turn sum of (old - teacher), in input order
         row_adv = [0.0] * len(rows)
+        n_nan_teacher = 0
         for mb in micro:
+            # A teacher logprob vLLM-TPU could not score is NaN (vllm_model.logprobs; chunked-prefill boundaries).
+            # Non-deferred workflows pass it through: take the student's own logprob there (zero advantage), else
+            # NaN * mask stays NaN and one such token makes the whole update NaN (2026-10-31 vanilla run).
+            nan = np.isnan(mb["teacher"])
+            if nan.any():
+                n_nan_teacher += int((nan & (mb["mask"] > 0)).sum())
+                mb["teacher"] = np.where(nan, mb["old"], mb["teacher"])
             mb["adv"] = cfg["kl_coef"] * (mb["teacher"] - mb["old"]) * mb["mask"]
             kl = ((mb["old"] - mb["teacher"]) * mb["mask"]).sum(-1)
             adv = mb["adv"].sum(-1)
@@ -209,16 +221,22 @@ class TunixActorWorker:
                 self.params, self.opt_state, grad_norm = self._apply_grads(
                     self.params, self.opt_state, grads_sum)
             grad_norm = float(grad_norm)
+            if not math.isfinite(grad_norm):
+                raise FloatingPointError(f"non-finite grad_norm {grad_norm} at train step {self.step + 1}: "
+                                         "weights are no longer valid, stopping")
         self.step += 1
         resp_len = [int(r["response_mask"].sum()) for r in rows]
         if cfg.get("policy_loss", "ppo") == "uopd":
             acc["uopd/trigger_rate"] = float(np.mean([bool(r.get("triggered", False)) for r in rows]))
             acc["uopd/sft_coef"] = cfg["sft_coef"]
+        elif cfg.get("policy_loss", "ppo") == "guided_opd":  # uopd/* keys = DASH's student / teacher branches
+            acc["guided_opd/teacher_turn_fraction"] = float(np.mean([bool(r.get("triggered", False)) for r in rows]))
         prompt_len = [len(r["prompt"]) for r in rows]
         metrics = {k: (float(np.mean(v)) if isinstance(v, list) else v) for k, v in acc.items()}
         metrics.update({
             "actor/grad_norm": grad_norm,
             "actor/lr": cfg["optimizer"]["lr"],
+            "tunix/nan_teacher_tokens": n_nan_teacher,  # response tokens whose teacher logprob was NaN (set to student's)
             "kl/mean": float(np.mean(kl_sums)),
             "kl/std": float(np.std(kl_sums, ddof=1)) if len(kl_sums) > 1 else 0.0,
             "advantages/mean": float(np.mean(adv_sums)),

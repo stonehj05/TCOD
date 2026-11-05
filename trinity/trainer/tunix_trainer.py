@@ -50,8 +50,13 @@ class TunixTrainerWrapper(TrainEngineWrapper):
             raise NotImplementedError(
                 f"tunix trainer implements on_policy_distill only, got {algo.algorithm_type}")
         policy_loss = algo.policy_loss_fn or "ppo"
-        if policy_loss not in ("ppo", "uopd"):
-            raise NotImplementedError(f"tunix trainer implements policy_loss_fn ppo and uopd, got {policy_loss}")
+        if policy_loss not in ("ppo", "uopd", "guided_opd"):
+            raise NotImplementedError(f"tunix trainer implements policy_loss_fn ppo, uopd and guided_opd, got {policy_loss}")
+        # guided_opd (DASH-OPD) pairs with its guided_opd advantage = multi_turn_opd's kl_coef * (teacher - old)
+        # on student turns (teacher turns take no advantage: they get the NLL term); the worker computes it.
+        if algo.advantage_fn not in ("multi_turn_opd", "guided_opd"):
+            raise NotImplementedError(f"tunix trainer implements advantage_fn multi_turn_opd and guided_opd, "
+                                      f"got {algo.advantage_fn}")
         loss_args = {"clip_range": 0.2, "clip_ratio_c": 3.0, "loss_agg_mode": "token-mean",
                      **(algo.policy_loss_fn_args or {})}
         adv_args = {"kl_coef": 1.0, **(algo.advantage_fn_args or {})}
@@ -75,6 +80,8 @@ class TunixTrainerWrapper(TrainEngineWrapper):
             # uopd (UOPD_alfworld_workflow): rows the teacher took over get SFT on its tokens
             "policy_loss": policy_loss,
             "sft_coef": float(loss_args.get("sft_coef", 1.0)),
+            # guided_opd: weight of the teacher-turn NLL (its policy_loss_fn_args.kl_coef)
+            "guided_kl_coef": float(loss_args.get("kl_coef", 1.0)),
             "ppo_epochs": 1,
             "rows_per_micro_batch": config.cluster.trainer_gpu_num,  # one row per chip
             "flash_block_size": block,
@@ -144,6 +151,20 @@ class TunixTrainerWrapper(TrainEngineWrapper):
             with open(self.local_latest_state_dict_iteration, "w") as f:
                 f.write(str(step))
             self.logger.info(f"Resumed exact training state at step {step} from {state_dir}.")
+        # Weights-only continuation (opt-in): <run dir>/init_step_from_weights.txt holding N means model.model_path
+        # holds the step-N weights of an earlier run and training continues as step N + 1 (fresh optimizer state;
+        # the explorer starts from model version N through the published sync checkpoint).
+        init_file = os.path.join(self.default_local_dir, "init_step_from_weights.txt")
+        if resume_step is None and os.path.exists(init_file):
+            with open(init_file) as f:
+                step = int(f.read().strip())
+            self._train_step_num = self._last_checkpoint_step = step
+            await self.worker.save_hf.remote(sync_checkpoint_dir(self.config, step))
+            self._last_state_dict_step = step
+            with open(self.local_latest_state_dict_iteration, "w") as f:
+                f.write(str(step))
+            self.logger.info(f"Continuing from the step-{step} weights of {self.config.model.model_path} "
+                             "(weights only, fresh optimizer state).")
 
     @property
     def train_step_num(self) -> int:
@@ -163,7 +184,9 @@ class TunixTrainerWrapper(TrainEngineWrapper):
                 else np.asarray(exp.action_mask, dtype=bool))
         return {"prompt": tokens[:exp.prompt_length], "response": response,
                 "response_mask": mask, "teacher_logprobs": teacher,
-                "triggered": bool((exp.info or {}).get("is_triggered", False))}
+                # teacher-executed turn: UOPD's is_triggered, DASH-OPD's is_teacher_turn (its teacher_turn_mask)
+                "triggered": bool((exp.info or {}).get("is_triggered", False)
+                                  or (exp.info or {}).get("is_teacher_turn", False))}
 
     async def train_step(self, batch_exps: List[Experience]) -> Dict:
         gate_metrics = await self.teacher_gate.annotate(batch_exps) if self.teacher_gate.enabled else {}

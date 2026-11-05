@@ -1,0 +1,121 @@
+# Vanilla OPD on WebShop, NOT deferred, with the Qwen3-1.7B student / Qwen3-8B teacher on HALF of the v4-32 (8 chips)
+# (user, 2026-11-03: "build a non-deferred vanilla OPD run with 100 steps"). It is
+# qwen3_1.7b_8b_opd_gated_t07_s03_dashtpl_p05_deferred_8chip_tpu.yaml (our gated 1.7B/8B run: same rollout, prompts,
+# sessions, shuffling, models, layout, 100 steps / save 25) with the gate removed, as opd_dashtpl_deferred_tpu.yaml
+# is for the 4B/30B gated run: workflow OPD_webshop_workflow_dashtpl (every student turn scored by the teacher at
+# full weight; no agreement / progress question, no look-ahead; the gate's workflow_args and progress_score dropped).
+# Not deferred: the teacher engines score the turns during rollout (the explorer), not the trainer.
+# TPU fix (2026-11-03): NaN logprobs from vLLM-TPU (tokens it could not score) are replaced in the workflow
+# (logprob_utils.fill_unscored) and in the trainer.
+# TPU layout (scripts/tpu/start_cluster_pair.sh): trainer (4 chips) on one worker, 2 students + 2 teachers (one chip
+# each) + the WebShop servers on the other. Launcher: ~/tcod_runs/launch_webshop_qwen3_1.7b_8b_pair.sh vanilla a
+project: "WEBSHOP_TCOD"
+name: "webshop_qwen3_1.7b_8b_opd_dashtpl_8chip_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links) is used
+
+# Mechanism: trinity/common/workflows/envs/TCOD/webshop/OPD_workflow_dashtpl.py
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  # Student model: plain Qwen/Qwen3-4B, as our other runs (TCOD's WebShop opd.yaml: Qwen2.5-3B-Instruct).
+  model_path: /dev/shm/models/Qwen3-1.7B  # TPU: tmpfs copy on both hosts
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 2      # TPU: 2 VMs x 4 chips; trainer = 8 - (2 students + 2 teachers) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000  # explorer steps: upper bound only; the run ends on trainer.total_steps
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's get_webshop_data.py (4096 train sessions); on every worker
+      split: train
+      task_selector:  # DASH-OPD's WebShop configs (paper App. M: seed 42 everywhere); 150 x 16 < 4096: one epoch
+        selector_type: shuffle
+        seed: 42
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0  # as TCOD's WebShop configs (the workflow default)
+        max_env_steps: 15  # TCOD's WebShop configs
+        # TPU: no defer_teacher -- the teacher engines score every student turn in the explorer
+        # (OPD_workflow_dashtpl.py's non-deferred path), as the 1.7B/8B ALFWorld vanilla OPD run.
+        defer_teacher: false
+    default_workflow_type: 'OPD_webshop_workflow_dashtpl'
+  trainer_input:
+    experience_buffer:
+      name: webshop_qwen3_1.7b_8b_opd_dashtpl_8chip_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true  # DASH-OPD's WebShop configs
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_qwen3_1.7b_8b_opd_dashtpl_8chip_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 2  # TPU: 2 students, one chip each
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    # Teacher model: plain Qwen/Qwen3-30B-A3B, as our other runs (TCOD's opd.yaml: /path/to/teacher).
+    - model_path: /dev/shm/models/Qwen3-8B  # TPU: tmpfs copy on the inference host
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: two teachers, one chip each
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.75  # as the ALFWorld 1.7B/8B runs (room for the scoring program)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 100  # user, 2026-11-02: "Launch with step 100" (TCOD's WebShop configs: 150)
+  save_interval: 25  # user, 2026-10-21 (4B run); checkpoints 25 / 50 / 75 / 100
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

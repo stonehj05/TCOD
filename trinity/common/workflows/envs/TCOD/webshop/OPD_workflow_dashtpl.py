@@ -17,6 +17,7 @@ import torch
 
 from trinity.common.experience import Experience
 from trinity.common.workflows import WORKFLOWS
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored
 from trinity.common.workflows.envs.TCOD.webshop.OPD_gated_workflow_student_teacher_lookahead import (
     OPDGatedWebshopWorkflowStudentTeacherLookahead,
 )
@@ -48,6 +49,8 @@ class OnPolicyDistillWebshopWorkflowDashTpl(OPDGatedWebshopWorkflowStudentTeache
                     f"Length mismatch: teacher_logprobs={len(teacher_resp_logprobs)}, "
                     f"student_logprobs={len(response.logprobs)}"
                 )
+                # TPU: NaN = a token vLLM-TPU could not score -> the student's value (no signal there)
+                teacher_resp_logprobs = fill_unscored(teacher_resp_logprobs, response.logprobs)
                 response.teacher_logprobs = teacher_resp_logprobs
                 response.teacher_logprobs_valid_mask = torch.full(
                     (len(teacher_resp_logprobs),), True, dtype=torch.bool

@@ -1,0 +1,157 @@
+# DASH-OPD on WebShop as its release runs it: github.com/Lucian1115/DASH-OPD (commit dc0aa86),
+# configurations/webshop/dash_opd.yaml, with the Qwen3-1.7B student (as the release) and the Qwen3-8B teacher
+# (release: Qwen3-30B-A3B), on HALF of the v4-32 (8 chips) (user, 2026-11-02: "build a webshop ... DASH-OPD run with
+# 8B teacher + 1.7B student"). Built as TCOD_examples/alfworld/dash_opd_qwen3_8b_to_1.7b_8chip_tpu.yaml (whose header
+# lists every TPU change) with exactly the release's differences between its ALFWorld and WebShop dash_opd.yaml:
+# project / names, no model.max_model_len, tasks (webshop, task_id), 15 env steps, 150 training steps (and the
+# teacher-start schedule over 150), takeover_threshold 1.5 / return_threshold 0.5, DASH_OPD_webshop_workflow.
+# Not as the release, besides the ALFWorld port's TPU changes: checkpoint every 25 steps (release: 150, final only;
+# 25 as our WebShop runs); the workflow (trinity/common/workflows/envs/DASH/webshop/) plays on our shared WebShop
+# servers (same shop: full catalog, human goals, text_rich) instead of one in-process env per game; tasks = TCOD's
+# WebShop data (the release's get_webshop_data.py makes the same sessions: 0-4095 train, 4096-4195 test).
+# Needs WebShop's code, data and index on every worker (see the WebShop gated configs' header).
+# Launcher: ~/tcod_runs/launch_webshop_qwen3_1.7b_8b_pair.sh dash <pair>
+project: "WEBSHOP_TCOD"
+name: "webshop_dash_opd_qwen3_8b_to_1.7b_8chip_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for the checkpoints) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: guided_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  policy_loss_fn: guided_opd
+  policy_loss_fn_args:
+    clip_range: 0.2
+    clip_ratio_c: 3.0
+    loss_agg_mode: token-mean
+    enable_sequence_masking: false
+    delta_sequence_masking: 0.1
+    fallback_to_policy_gradient: false
+    kl_coef: 1.0
+  loss_agg_mode: "token-mean"
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: /dev/shm/models/Qwen3-1.7B  # TPU: tmpfs copy on both hosts
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 2      # TPU: 2 VMs x 4 chips; trainer = 8 - (2 students + 2 teachers) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 3000
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: webshop
+      storage_type: file
+      path: /home/haojun_shi/TCOD/TCOD_examples/webshop/webshop_data  # TCOD's get_webshop_data.py output (= the release's get_webshop_data.py; sessions 0-4095 train)
+      split: train
+      task_selector:
+        selector_type: shuffle
+        seed: 42
+        reshuffle_each_epoch: true  # DASH-OPD's ShuffleSelector
+      format:
+        prompt_key: 'task_id'
+      rollout_args:
+        temperature: 1.0
+        max_tokens: 512
+        top_p: 1.0
+        top_k: -1
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 15
+        history_length: 2
+        initial_no_history_turns: 3
+        include_think_in_history: false
+        retain_full_chat_history: true
+        total_steps: 100  # teacher-start schedule over the whole run, as the release (150 = its 150 training steps)
+        # DASH-only controller settings.
+        teacher_start_schedule_enabled: true
+        teacher_takeover_enabled: true
+        student_return_enabled: true
+        action_only_role_switching: true
+        exact_mean_variance: true
+        ema_decay: 0.9
+        ema_variance_floor: 1e-6
+        z_clip: 10.0
+        evidence_decay: 1.0
+        student_drift_slack: 0.0
+        teacher_recovery_slack: 0.0
+        takeover_threshold: 1.5
+        return_threshold: 0.5
+        min_teacher_span: 2
+        teacher_budget_ratio: 1.0
+        stagnation_takeover_enabled: true
+        stagnation_repeat_turns: 3
+    default_workflow_type: 'DASH_OPD_webshop_workflow'
+  trainer_input:
+    experience_buffer:
+      name: webshop_dash_opd_qwen3_8b_to_1.7b_8chip_tpu_buffer
+      storage_type: queue
+      shuffle_experiences: true
+      shuffle_seed: 42
+      path: 'sqlite:////dev/shm/tcod_buffers/webshop_dash_opd_qwen3_8b_to_1.7b_8chip_tpu_buffer.db'  # node-local tmpfs
+
+explorer:
+  runner_per_model: 8
+  max_timeout: 900
+  max_retry_times: 0
+  # ALFWorld-only timeout settings above (release).
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 2  # TPU: 2 students, one chip each (release: 2 x TP2)
+    tensor_parallel_size: 1
+    enable_thinking: false
+    prompt_truncation_keep_recent: true  # DASH-OPD's prompt truncation
+    enable_prefix_caching: true
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-8B  # TPU: tmpfs copy on the inference host (release: Qwen3-30B-A3B)
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: 2 teachers, one chip each (release: 1 x TP2)
+      enable_thinking: false
+      tensor_parallel_size: 1
+      prompt_truncation_keep_recent: true  # DASH-OPD's prompt truncation (the teacher also generates turns)
+      gpu_memory_utilization: 0.75  # TPU: as in opd_qwen3_1.7b_8b_fullmemory_8chip_tpu.yaml (room for the scoring program)
+      enable_prefix_caching: true
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 10752
+      max_prompt_tokens: 10240
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250  # user, 2026-11-03: "run the training up to step 250, with 50 save frequency" (exact resume from step 100; first launch: 100)
+  save_interval: 50  # user, 2026-11-03 (steps 25-100 were saved every 25); release: 150 (final only)
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard

@@ -38,6 +38,7 @@ from typing import List, Optional, Tuple
 from trinity.common.experience import Experience
 from trinity.common.models.model import ModelWrapper
 from trinity.common.workflows import WORKFLOWS, Task
+from trinity.common.workflows.envs.TCOD.logprob_utils import fill_unscored
 from trinity.common.workflows.envs.TCOD.alfworld.TCOD_b2f_workflow import (
     TCOD_b2f_alfworld_workflow,
 )
@@ -300,7 +301,7 @@ class Bridge_TCOD_kl_alfworld_workflow(TCOD_b2f_alfworld_workflow):
                 temperature=self.temperature,
             )
             rs = resp.prompt_length - 1
-            resp.teacher_logprobs = teacher_lp[rs:]
+            resp.teacher_logprobs = fill_unscored(teacher_lp[rs:], resp.logprobs)  # TPU: NaN = unscored
             if resp.metrics is None:
                 resp.metrics = {}
             resp.reward   = self.compute_reward(resp)
@@ -439,8 +440,9 @@ class Bridge_TCOD_kl_alfworld_workflow(TCOD_b2f_alfworld_workflow):
         except Exception:
             return []
 
-        student_lp = student_lp_full[resp_start:]
-        teacher_lp = teacher_lp_full[resp_start:]
+        # TPU: NaN = token one engine could not score; take the other's, 0 if neither scored it
+        student_lp = fill_unscored(student_lp_full[resp_start:], teacher_lp_full[resp_start:])
+        teacher_lp = fill_unscored(teacher_lp_full[resp_start:], student_lp)
 
         exp = copy.copy(bridge_resp)
         exp.logprobs         = student_lp

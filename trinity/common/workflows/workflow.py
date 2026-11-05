@@ -34,6 +34,7 @@ class Task(dict):
     # automatically assigned ids
     batch_id: Union[int, str] = ""
     task_id: Union[int, str] = ""
+    rollout_model_version: Optional[int] = None  # as in DASH-OPD: the policy version this task is rolled out with
 
     index: dict = field(default_factory=dict)
 

@@ -105,6 +105,48 @@ def opd_loss(model, train_example, *, pad_id, eos_id, temperature, clip_low, cli
     return loss, aux
 
 
+def guided_opd_loss(model, train_example, *, pad_id, eos_id, temperature, clip_low, clip_high, clip_ratio_c,
+                    kl_coef=1.0, loss_agg_mode="token-mean"):
+    """DASH-OPD's GuidedOPDPolicyLossFn (algorithm/policy_loss_fn/guided_opd_policy_loss.py) in JAX.
+
+    Student-generated turns get the dual-clip PPO loss of opd_loss; teacher-generated turns (`triggered`, from
+    the workflow's is_teacher_turn) get the sampled forward KL kl_coef * -log p on the teacher's tokens. The
+    release combines the two token-means weighted by their token counts = one token-mean over both.
+    """
+    mask = train_example.completion_mask.astype(jnp.float32)
+    logps, entropy = completion_logps(model, train_example.prompt_ids, train_example.completion_ids,
+                                      pad_id, eos_id, temperature, return_entropy=True)
+    old = train_example.old_per_token_logps.astype(jnp.float32)
+    adv = train_example.advantages.astype(jnp.float32)
+    trig = (train_example.triggered > 0.5)[:, None]  # [B, 1] teacher turn
+
+    log_ratio = jnp.clip(logps - old, -20.0, 20.0)
+    ratio = jnp.exp(log_ratio)
+    pg1 = -adv * ratio
+    pg2 = -adv * jnp.clip(ratio, 1.0 - clip_low, 1.0 + clip_high)
+    clipped = jnp.maximum(pg1, pg2)
+    pg3 = -adv * clip_ratio_c
+    pg_tok = jnp.where(adv < 0.0, jnp.minimum(clipped, pg3), clipped)
+    sft_tok = kl_coef * (-logps)
+    per_token = jnp.where(trig, sft_tok, pg_tok)
+    loss = common.aggregate_loss(per_token, mask, loss_agg_mode)
+
+    trig_mask = mask * trig
+    pg_mask = mask * (~trig)
+    denom = jnp.clip(mask.sum(), min=1.0)
+    pg_denom = jnp.clip(pg_mask.sum(), min=1.0)
+    aux = {
+        "pg_clipfrac": ((pg2 > pg1) * pg_mask).sum() / pg_denom,
+        "pg_clipfrac_lower": (((clipped > pg3) & (adv < 0.0)) * pg_mask).sum() / pg_denom,
+        "ppo_kl": (-log_ratio * pg_mask).sum() / pg_denom,
+        "entropy": (jax.lax.stop_gradient(entropy) * mask).sum() / denom,
+        # same keys as uopd_loss so the worker's per-branch bookkeeping applies
+        "uopd/sft_loss": jax.lax.stop_gradient((sft_tok * trig_mask).sum() / jnp.clip(trig_mask.sum(), min=1.0)),
+        "uopd/pg_loss": jax.lax.stop_gradient((pg_tok * pg_mask).sum() / pg_denom),
+    }
+    return loss, aux
+
+
 def uopd_loss(model, train_example, *, pad_id, eos_id, temperature, sft_coef=1.0,
               loss_agg_mode="token-mean"):
     """UOPD's UOPDPolicyLossFn (algorithm/policy_loss_fn/uopd_policy_loss.py) in JAX.

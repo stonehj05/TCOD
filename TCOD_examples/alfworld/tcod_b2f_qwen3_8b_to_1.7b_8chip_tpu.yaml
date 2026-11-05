@@ -1,0 +1,115 @@
+# TCOD-b2f (Backward-to-Forward temporal curriculum) on ALFWorld with the Qwen3-1.7B student / Qwen3-8B teacher, on
+# HALF of the v4-32 (8 chips) (user, 2026-11-02: "staying faithful to their original implementation"). Everything as in
+# tcod_b2f_qwen3_30b_to_4b_tpu.yaml (the repo's original tcod_b2f.yaml ported to TPU; see its header for what differs
+# from the original), except the models and the engine layout. TPU: NaN logprobs from vLLM-TPU are replaced
+# (logprob_utils.fill_unscored in the workflow, and in the trainer).
+# TPU layout (one 2-host Ray cluster of its own, scripts/tpu/start_cluster_pair.sh): one worker = trainer (4 chips),
+# the other = 2 students + 2 teachers (Qwen3-8B, one chip each), as the 1.7B/8B OPD runs. Launcher with checks,
+# checkpoint links and eval: ~/tcod_runs/launch_alfworld_baseline_qwen3_1.7b_8b_pair.sh <method> <pair>   (on worker 0)
+project: "ALFWORLD_TCOD"
+name: "alfworld_tcod_b2f_qwen3_8b_to_1.7b_8chip_tpu"
+checkpoint_root_dir: ./checkpoints
+continue_from_checkpoint: true   # fresh run; true only so the pre-created run dir (tmpfs links for the checkpoints) is used
+
+algorithm:
+  sample_strategy: staleness_control
+  sample_strategy_args:
+    max_staleness: 2
+  algorithm_type: on_policy_distill
+  advantage_fn: multi_turn_opd
+  repeat_times: 1
+  advantage_fn_args:
+    kl_coef: 1.0
+  optimizer:
+    lr: 1e-6
+
+model:
+  model_path: /dev/shm/models/Qwen3-1.7B  # TPU: tmpfs copy on both hosts
+  max_prompt_tokens: 10240
+  max_response_tokens: 512
+
+cluster:
+  node_num: 2      # TPU: 2 VMs x 4 chips; trainer = 8 - (2 students + 2 teachers) = 4
+  gpu_per_node: 4
+
+buffer:
+  total_steps: 400  # explorer steps: upper bound only (original: 250); the run ends on trainer.total_steps
+  # Rollout batch: games per explore step. 16 as in the GPU configs (the sibling
+  # opd_gated_disagree_lookahead_tpu.yaml uses 8).
+  batch_size: 16
+  train_batch_size: 64
+  explorer_input:
+    taskset:
+      name: alfworld
+      storage_type: file
+      path: /home/haojun_shi/alf-data/tcod_tasks/train_expert.jsonl  # TPU VM copy (game_file paths remapped)
+      split: train
+      format:
+        prompt_key: 'game_file'
+      rollout_args:
+        temperature: 1.0
+        # Required by OPD workflow to compute student-teacher token logprob gap
+        logprobs: 0
+      workflow_args:
+        temperature: 1.0
+        max_env_steps: 30
+        # Back-to-front curriculum, as in tcod_b2f.yaml
+        total_steps: 250
+        checkpoint_strategy: linear
+        checkpoint_steps: 5
+    default_workflow_type: 'TCOD_b2f_alfworld_workflow'
+  trainer_input:
+    experience_buffer:
+      name: alfworld_tcod_b2f_qwen3_8b_to_1.7b_8chip_tpu_buffer
+      storage_type: queue
+      # Absolute path on node-local tmpfs (the dir must exist on every worker). A relative path is
+      # created in the home directory of whichever worker hosts the queue actor and silently
+      # fills that worker's disk.
+      path: 'sqlite:////dev/shm/tcod_buffers/alfworld_tcod_b2f_qwen3_8b_to_1.7b_8chip_tpu_buffer.db'
+
+explorer:
+  eval_interval: 5
+  runner_per_model: 8
+  max_timeout: 3600
+  rollout_model:
+    engine_type: vllm_tpu
+    engine_num: 2  # TPU: 2 students, one chip each (GPU run: 2)
+    tensor_parallel_size: 1
+    enable_prefix_caching: false
+    enforce_eager: true
+    dtype: bfloat16
+    seed: 42
+    gpu_memory_utilization: 0.7
+    enable_chunked_prefill: true
+  auxiliary_models:
+    - model_path: /dev/shm/models/Qwen3-8B  # TPU: tmpfs copy on the inference host
+      engine_type: vllm_tpu
+      engine_num: 2  # TPU: 2 teachers, one chip each
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.75  # as in opd_qwen3_1.7b_8b_fullmemory_8chip_tpu.yaml (room for the scoring program)
+      enable_prefix_caching: false
+      enforce_eager: true
+      dtype: bfloat16
+      seed: 42
+      max_model_len: 20480
+      max_prompt_tokens: 16384
+      max_response_tokens: 512
+  env_vars:
+    TMPDIR: /dev/shm/tmp
+    RAY_TMPDIR: /dev/shm/ray_tmp
+
+synchronizer:
+  sync_method: 'checkpoint'  # TPU: NCCL is CUDA-only
+  sync_style: 'dynamic_by_explorer'
+  sync_interval: 1
+  sync_timeout: 3600
+
+trainer:
+  trainer_type: tunix  # TPU: JAX trainer (verl's dynamic-bsz / ulysses settings don't apply)
+  total_steps: 250
+  save_interval: 50  # original: 250 (final only); every 50 here so the run can be evaluated along the way
+  grad_clip: 1.0
+  sync_checkpoint_dir: /dev/shm/tcod_sync  # TPU: per-step weight-sync checkpoints on tmpfs
+
+monitor:
+  monitor_type: tensorboard  # TPU run: no wandb credentials on this machine

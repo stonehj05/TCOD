@@ -6,6 +6,7 @@ an SFT target. Student-executed turns receive OPD supervision.
 """
 
 import random as _random
+import re
 from typing import Dict, List, Optional
 
 import torch
@@ -227,6 +228,39 @@ def mark_experience(exp: Experience, is_triggered: bool) -> Experience:
     exp.info["is_triggered"] = bool(is_triggered)
     exp.custom_fields = [UOPD_TRIGGER_FIELD]
     return exp
+
+
+_THINK_CLOSE_PREFIX = re.compile(r"^\s*(?:</think>\s*)+")
+
+
+def strip_teacher_think_close(teacher_turn: Experience, tokenizer) -> int:
+    """TPU (not in the release): drop stray leading ``</think>`` tags from a teacher decode.
+
+    The per-turn prompt already ends with the empty ``<think>\\n\\n</think>\\n\\n`` block, yet
+    Qwen3-8B as teacher opens nearly every decode with more ``</think>`` tags. Trigger rows
+    are SFT targets for the student, so left in they teach the student to emit runs of
+    ``</think>`` (the 1.7B/8B ALFWorld run collapsed to 2-5% this way). Strips the leading
+    ``</think>``/whitespace tokens from ``tokens``, ``logprobs``, ``action_mask`` and
+    ``response_text``; a decode without a leading ``</think>`` is left as is. Returns the
+    number of tokens removed.
+    """
+    pl = teacher_turn.prompt_length
+    resp = teacher_turn.tokens[pl:].tolist()
+    close = tokenizer.convert_tokens_to_ids("</think>")
+    k = 0
+    while k < len(resp) and (resp[k] == close or not tokenizer.decode([resp[k]]).strip()):
+        k += 1
+    if k == 0 or k == len(resp) or close not in resp[:k]:
+        return 0
+    teacher_turn.tokens = torch.cat([teacher_turn.tokens[:pl], teacher_turn.tokens[pl + k :]])
+    for name in ("logprobs", "action_mask"):
+        value = getattr(teacher_turn, name)
+        if value is not None and len(value) == len(resp):
+            setattr(teacher_turn, name, value[k:])
+    if teacher_turn.response_text is not None:
+        teacher_turn.response_text = _THINK_CLOSE_PREFIX.sub("", teacher_turn.response_text)
+    teacher_turn.info = {**(teacher_turn.info or {}), "teacher_think_close_stripped": k}
+    return k
 
 
 def build_trigger_experience(teacher_turn: Experience) -> Experience:
