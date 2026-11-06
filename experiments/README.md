@@ -570,19 +570,22 @@ turn; an earlier 8-chip attempt without it was stopped at step 70). References, 
 | step 150 | 7.5 | 6.5 ± 0.3 | 0.217 ± 0.006 | 0 |
 | step 200 | 9.7 | 7.3 ± 0.5 | 0.257 ± 0.009 | 0 |
 | step 250 | 12.0 | 10.0 ± 1.0 | 0.307 ± 0.006 | 0 |
+| step 300 | 14.0 | 10.1 ± 0.5 | 0.304 ± 0.003 | 0 |
+| step 350 | 16.0 | 9.1 ± 0.9 | 0.296 ± 0.009 | 0 |
 
 **DASH-OPD** (`dash_opd_qwen3_8b_to_1.7b_16chip_tpu.yaml`, following the release's
 `configurations/scienceworld/dash_opd.yaml`; 6 students + 6 teachers; median step 2.87 min).
-Steps 150 and 200 were not evaluated.
 
 | Checkpoint | Train h | Success | Mean score | Errored games |
 |---|---|---|---|---|
 | step 250 | 11.8 | 10.1 ± 0.7 | 0.344 ± 0.007 | 0 |
+| step 300 | 14.1 | 11.6 ± 1.1 | 0.391 ± 0.007 | 0 |
+| step 350 | 16.5 | 9.8 ± 0.8 | 0.315 ± 0.005 | 0 |
 
-**In progress (2026-11-05):** both runs are being continued by exact resume from step 250 to
-350 (`..._resume350.yaml`, save every 50; DASH's teacher-start schedule keeps
-`workflow_args.total_steps: 250`). DASH-OPD was at step 287 (13.4 h) at 23:42 UTC; the gated
-run follows. Steps 300 and 350 of both will be evaluated when both have finished.
+Steps 300 and 350 of both runs come from an exact resume of the step-250 state with
+`total_steps: 350` (`..._resume350.yaml`, save every 50); DASH's teacher-start schedule keeps
+`workflow_args.total_steps: 250`. Checkpoints before step 250 were deleted unevaluated for
+DASH-OPD (150, 200).
 
 ## WebShop
 
